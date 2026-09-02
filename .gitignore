@@ -1,1 +1,5 @@
-__pycache__
+__pycache__/
+*.py[cod]
+
+# Dữ liệu sinh ra từ export_data
+demo/data/exported_data/
