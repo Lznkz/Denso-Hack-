@@ -24,6 +24,7 @@ CONFIG = {
     "val_fraction": 0.2,
     "patience": 5,
     "seed": 0,
+    "device": "mps" if torch.backends.mps.is_available() else "cpu",
 }
 
 
@@ -70,6 +71,7 @@ def main():
     train_engines, val_engines = split_train_val(all_engines, cfg["val_fraction"], cfg["seed"])
     normalize_engines(train_engines, val_engines)
     print(f"{len(train_engines)} engine train, {len(val_engines)} engine validation")
+    print(f"device: {cfg['device']}")
 
     n_sensors = train_engines[0].X.shape[1]
     w_dim = train_engines[0].W.shape[1]
@@ -80,7 +82,7 @@ def main():
         window_len=cfg["window_len"], stride=cfg["train_stride"],
         z_dim=cfg["z_dim"], n_epochs=cfg["n_epochs"], lr=cfg["lr"],
         engines_per_batch=cfg["engines_per_batch"], seed=cfg["seed"],
-        patience=cfg["patience"],
+        patience=cfg["patience"], device=cfg["device"],
     )
 
     torch.save(model.state_dict(), "smart_ae.pt")
@@ -90,7 +92,8 @@ def main():
     example_engine = val_engines[0]
     latents = extract_latents_for_engine(model, example_engine,
                                           window_len=cfg["window_len"],
-                                          bin_stride=cfg["bin_stride"])
+                                          bin_stride=cfg["bin_stride"],
+                                          device=cfg["device"])
     z_seq = latents.X   # LƯU Ý: field X ở đây thực chất là Z, không phải sensor
     drift = z_drift_per_engine(z_seq)
     drift_smooth = smooth_signal(drift)
