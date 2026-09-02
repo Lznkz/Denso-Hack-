@@ -1,25 +1,40 @@
 """
-split_cmapss.py
+data.py
 
-Chuẩn bị C-MAPSS TRAIN cho experiment:
+Prepare C-MAPSS TRAIN for a realistic degradation simulation.
 
-    .txt
-      ↓
-    DataFrame
-      ↓
-    engine trajectories
-      ↓
-    70% development / 30% test
-      ↓
-    development: truncate quanh elbow ~130
-    test: initial observation state
+Design
+------
+Original C-MAPSS:
+    engine trajectory -> run-to-failure
 
-Chỉ sử dụng TRAIN của C-MAPSS.
+Our simulation:
+    1. Split engines into TRAIN / TEST.
+    2. TRAIN:
+        - mostly normal observed trajectories
+        - a small number of trajectories contain rare abnormal patterns
+        - trajectories are NEVER extended beyond their original length
+    3. TEST:
+        - only an initial fraction of each trajectory is observable
+        - the remaining trajectory stays hidden for realtime simulation
+    4. Keep original full trajectories untouched for evaluation.
+
+Important semantic separation
+-----------------------------
+observation cutoff
+    != degradation onset
+    != failure event
+    != rare abnormal event
 """
 
 from dataclasses import dataclass
 import numpy as np
 import pandas as pd
+
+from demo.core.fault_injection import (
+    DEFAULT_FAULT_METADATA,
+    inject_rare_fault,
+)
 
 
 # ============================================================
@@ -28,33 +43,49 @@ import pandas as pd
 
 @dataclass
 class SplitConfig:
-
     # Dataset
-    data_path: str = "data/train_FD001.txt"
-
-    # Engine split
-    train_ratio: float = 0.70
+    data_path: str = "demo/data/train_FD002.txt"
     random_seed: int = 42
 
-    # Piecewise-linear elbow
-    elbow_cycle: int = 130
-    elbow_tolerance: int = 10
+    # TRAIN / TEST split
+    train_ratio: float = 0.70
 
-    # Một phần development engines được giữ lâu hơn elbow
-    extended_probability: float = 0.20
-    extended_max_extra: int = 50
+    # TRAIN observation boundary
+    observation_cycle_min: int = 130
+    observation_cycle_max: int = 135
 
-    # Không để development engine quá gần failure
-    min_cycles_before_failure: int = 20
+    # Rare abnormal trajectory simulation
+    rare_fault_probability: float = 0.20
+    rare_fault_max_duration: int = 10
+    rare_fault_start_cycle_min: int = 60
+    rare_fault_magnitude_min: float = 0.03
+    rare_fault_magnitude_max: float = 0.10
+    rare_fault_types: tuple[str, ...] = (
+        "plateau",
+        "drop",
+        "drift",
+    )
 
-    # Initial observation của test
+    # TEST observation fraction
     test_fraction_min: float = 0.10
     test_fraction_max: float = 0.30
 
 
 # ============================================================
-# C-MAPSS COLUMN DEFINITION
+# OPERATIONAL SETTINGS & SENSOR DEFINITIONS
 # ============================================================
+
+OP_SETTINGS = [
+    "op1",
+    "op2",
+    "op3",
+]
+
+ALL_SENSORS = [
+    "T2", "T24", "T30", "T50", "P2", "P15", "P30", "Nf", "Nc",
+    "epr", "Ps30", "phi", "NRf", "NRc", "BPR", "farB", "htBleed",
+    "Nfdmd", "PCNfRdmd", "W31", "W32",
+]
 
 SENSORS = [
     "T24",
@@ -69,32 +100,24 @@ SENSORS = [
 ]
 
 
+# ============================================================
+# LOAD C-MAPSS
+# ============================================================
+
 def load_cmapss_train(config: SplitConfig):
     """
-    Load C-MAPSS TRAIN và trả về DataFrame + engine trajectories.
+    Load C-MAPSS TRAIN.
+
+    Returns
+    -------
+    df:
+        Original dataframe containing the selected sensors and operational settings.
+    engine_data:
+        Dictionary {engine_id: ndarray(n_cycles, n_sensors)}
+    op_data:
+        Dictionary {engine_id: ndarray(n_cycles, 3)}
     """
-
-    sensor_names = [
-        "T2", "T24", "T30", "T50",
-        "P2", "P15", "P30",
-        "Nf", "Nc", "epr",
-        "Ps30", "phi", "NRf", "NRc",
-        "BPR", "farB", "htBleed",
-        "Nfdmd", "PCNfRdmd",
-        "W31", "W32",
-    ]
-
-    columns = [
-        "unit_number",
-        "cycles",
-        "op1",
-        "op2",
-        "op3",
-    ] + sensor_names
-
-    # --------------------------------------------------------
-    # Load raw C-MAPSS
-    # --------------------------------------------------------
+    columns = ["unit_number", "cycles"] + OP_SETTINGS + ALL_SENSORS
 
     df = pd.read_csv(
         config.data_path,
@@ -103,193 +126,185 @@ def load_cmapss_train(config: SplitConfig):
         names=columns,
     )
 
-    # --------------------------------------------------------
-    # Chỉ giữ metadata + sensors sử dụng
-    # --------------------------------------------------------
-
-    df = df[
-        ["unit_number", "cycles"] + SENSORS
-    ].copy()
-
-    # --------------------------------------------------------
-    # Chuyển thành:
-    #
-    # {
-    #     engine_id: ndarray(n_cycles, n_sensors)
-    # }
-    # --------------------------------------------------------
+    df = df[["unit_number", "cycles"] + OP_SETTINGS + SENSORS].copy()
 
     engine_data = {}
+    op_data = {}
 
     for engine_id, group in df.groupby("unit_number"):
-
         group = group.sort_values("cycles")
+        engine_data[int(engine_id)] = group[SENSORS].to_numpy(dtype=np.float32)
+        op_data[int(engine_id)] = group[OP_SETTINGS].to_numpy(dtype=np.float32)
 
-        engine_data[int(engine_id)] = (
-            group[SENSORS]
-            .to_numpy(dtype=np.float32)
-        )
-
-    return df, engine_data
+    return df, engine_data, op_data
 
 
 # ============================================================
-# MAIN EXPERIMENT SPLIT
+# OBSERVATION CUTOFF
 # ============================================================
 
-def prepare_cmapss_split(config: SplitConfig = None):
-
-    if config is None:
-        config = SplitConfig()
-
-    # --------------------------------------------------------
-    # 1. Load data
-    # --------------------------------------------------------
-
-    df, engine_data = load_cmapss_train(config)
-
-    rng = np.random.default_rng(config.random_seed)
-
-    # --------------------------------------------------------
-    # 2. Split ENGINE 70 / 30
-    # --------------------------------------------------------
-
-    engine_ids = np.array(
-        sorted(engine_data.keys())
+def sample_observation_cutoff(
+    n_cycles: int,
+    config: SplitConfig,
+    rng: np.random.Generator,
+) -> int:
+    """
+    Sample the observation cutoff for a training engine.
+    """
+    target_cycle = rng.integers(
+        config.observation_cycle_min,
+        config.observation_cycle_max + 1,
     )
+    cutoff = min(target_cycle, n_cycles)
+    return max(1, cutoff)
 
-    rng.shuffle(engine_ids)
 
-    n_train = int(
-        len(engine_ids) * config.train_ratio
-    )
+# ============================================================
+# PREPARE TRAIN DATA
+# ============================================================
 
-    train_ids = sorted(
-        engine_ids[:n_train].tolist()
-    )
-
-    test_ids = sorted(
-        engine_ids[n_train:].tolist()
-    )
-
-    # --------------------------------------------------------
-    # 3. Development / Train trajectories
-    # --------------------------------------------------------
-
+def prepare_train_data(
+    train_ids,
+    engine_data,
+    op_data,
+    config: SplitConfig,
+    rng: np.random.Generator,
+):
+    """
+    Prepare observed training trajectories.
+    """
     train_data = {}
+    train_op_data = {}
     train_metadata = {}
 
     for engine_id in train_ids:
-
         full = engine_data[engine_id]
+        full_op = op_data[engine_id]
         n_cycles = len(full)
 
-        safe_max = max(
-            1,
-            n_cycles - config.min_cycles_before_failure
-        )
+        cutoff = sample_observation_cutoff(n_cycles, config, rng)
+        observed = full[:cutoff].copy()
+        observed_op = full_op[:cutoff].copy()
 
-        is_extended = (
-            rng.random() < config.extended_probability
-        )
-
-        if is_extended:
-            end = config.elbow_cycle + rng.integers(
-                1,
-                config.extended_max_extra + 1,
+        inject_fault = rng.random() < config.rare_fault_probability
+        if inject_fault:
+            observed, fault_metadata = inject_rare_fault(
+                trajectory=observed,
+                cutoff=len(observed),
+                config=config,
+                rng=rng,
+                sensor_names=SENSORS,
             )
         else:
-            end = rng.integers(
-                max(1, config.elbow_cycle - config.elbow_tolerance),
-                config.elbow_cycle + config.elbow_tolerance + 1,
-            )
+            fault_metadata = DEFAULT_FAULT_METADATA.copy()
 
-        end = min(end, safe_max)
-
-        train_data[engine_id] = full[:end]
+        train_data[engine_id] = observed
+        train_op_data[engine_id] = observed_op
 
         train_metadata[engine_id] = {
-            "is_extended": is_extended,
-            "observed_cycles": end,
+            "observed_cycles": len(observed),
+            "actual_rul_at_stop": n_cycles - len(observed),
+            "total_cycles": n_cycles,
+            "is_censored": len(observed) < n_cycles,
+            **fault_metadata,
         }
 
-    # --------------------------------------------------------
-    # 4. Test INITIAL OBSERVATION
-    #
-    # Đây chỉ là trạng thái quan sát tại thời điểm
-    # experiment bắt đầu.
-    #
-    # Chưa phải realtime simulation.
-    # Realtime simulator sẽ reveal thêm cycle sau này.
-    # --------------------------------------------------------
+    return train_data, train_op_data, train_metadata
 
-    test_rng = np.random.default_rng(
-        config.random_seed + 1
-    )
+
+# ============================================================
+# PREPARE TEST DATA
+# ============================================================
+
+def prepare_test_data(
+    test_ids,
+    engine_data,
+    op_data,
+    config: SplitConfig,
+):
+    """
+    Prepare initial observations for realtime testing.
+    """
+    test_rng = np.random.default_rng(config.random_seed + 1)
 
     test_data = {}
+    test_op_data = {}
     test_observation_points = {}
 
     for engine_id in test_ids:
-
         full = engine_data[engine_id]
-
+        full_op = op_data[engine_id]
         n_cycles = len(full)
 
-        # Mỗi engine bắt đầu experiment ở một
-        # observation point khác nhau.
         fraction = test_rng.uniform(
             config.test_fraction_min,
             config.test_fraction_max,
         )
 
-        end = max(
-            1,
-            int(n_cycles * fraction),
-        )
+        end = int(np.ceil(n_cycles * fraction))
+        end = max(1, min(end, n_cycles - 1))
 
-        # Không expose failure ngay từ initial state.
-        end = min(
-            end,
-            n_cycles - 1,
-        )
-
-        # Phần data hiện đang được quan sát.
         test_data[engine_id] = full[:end].copy()
-
-        # Lưu lại current observation point.
-        # Simulator sẽ dùng nó để biết cần reveal
-        # từ cycle nào tiếp theo.
+        test_op_data[engine_id] = full_op[:end].copy()
         test_observation_points[engine_id] = end
 
-    # --------------------------------------------------------
-    # 5. Return tất cả những gì notebook cần
-    # --------------------------------------------------------
+    return test_data, test_op_data, test_observation_points
 
+
+# ============================================================
+# MAIN SPLIT
+# ============================================================
+
+def prepare_cmapss_split(config: SplitConfig | None = None):
+    """
+    Main entry point.
+    """
+    if config is None:
+        config = SplitConfig()
+
+    # 1. Load original data
+    df, engine_data, op_data = load_cmapss_train(config)
+    rng = np.random.default_rng(config.random_seed)
+
+    # 2. Engine-level Train / Test Split
+    engine_ids = np.array(sorted(engine_data.keys()))
+    rng.shuffle(engine_ids)
+
+    n_train = int(len(engine_ids) * config.train_ratio)
+    train_ids = sorted(engine_ids[:n_train].tolist())
+    test_ids = sorted(engine_ids[n_train:].tolist())
+
+    # 3. Prepare Train
+    train_data, train_op_data, train_metadata = prepare_train_data(
+        train_ids=train_ids,
+        engine_data=engine_data,
+        op_data=op_data,
+        config=config,
+        rng=rng,
+    )
+
+    # 4. Prepare Test
+    test_data, test_op_data, test_observation_points = prepare_test_data(
+        test_ids=test_ids,
+        engine_data=engine_data,
+        op_data=op_data,
+        config=config,
+    )
+
+    # 5. Return
     return {
         "df": df,
-
-        # FULL trajectories.
-        # Giữ nguyên để simulator và evaluation sử dụng.
-        # Không đưa trực tiếp vào model.
         "engine_data": engine_data,
-
-        # 70% development
+        "op_data": op_data,
         "train_data": train_data,
+        "train_op_data": train_op_data,
         "train_ids": train_ids,
         "train_metadata": train_metadata,
-
-        # 30% test
-        # Chỉ chứa phần đã được observe tại thời điểm bắt đầu.
         "test_data": test_data,
+        "test_op_data": test_op_data,
         "test_ids": test_ids,
-
-        # Cycle hiện tại mà mỗi test engine đã được observe.
         "test_observation_points": test_observation_points,
-
-        # Sensors đang sử dụng
         "sensors": SENSORS,
-
-        # Config
+        "op_settings": OP_SETTINGS,
         "config": config,
     }

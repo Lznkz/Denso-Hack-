@@ -16,9 +16,9 @@ THAY ĐỔI SO VỚI BẢN TRƯỚC:
 import numpy as np
 import torch
 
-from windowing import EngineData, WindowBatch, cut_windows_for_engine, concat_window_batches
-from model import SmartConv1DAutoencoder
-from loss import smart_ae_loss
+from src.phaseI.core.windowing import EngineData, WindowBatch, cut_windows_for_engine, concat_window_batches
+from src.phaseI.core.model import SmartConv1DAutoencoder
+from src.phaseI.core.loss import smart_ae_loss
 
 
 def _build_same_engine_mask(unit_number: np.ndarray) -> torch.Tensor:

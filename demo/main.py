@@ -1,5 +1,9 @@
 import sys
 from pathlib import Path
+
+# Add project root to sys.path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from src.phaseI.main import run_phase1
 from src.phaseII.main import run_phase2
 
@@ -10,17 +14,23 @@ from demo.core.data import (
 
 
 config = SplitConfig(
-    data_path="demo/data/train_FD001.txt",
+    data_path="demo/data/train_FD002.txt",
 
     train_ratio=0.70,
 
-    elbow_cycle=130,
-    elbow_tolerance=5,
+    observation_cycle_min=130,
+    observation_cycle_max=135,
 
-    extended_probability=0.30,
-    extended_max_extra=50,
-
-    min_cycles_before_failure=20,
+    rare_fault_probability=0.20,
+    rare_fault_max_duration=10,
+    rare_fault_start_cycle_min=60,
+    rare_fault_magnitude_min=0.03,
+    rare_fault_magnitude_max=0.10,
+    rare_fault_types=(
+        "plateau",
+        "drop",
+        "drift",
+    ),
 
     test_fraction_min=0.10,
     test_fraction_max=0.30,

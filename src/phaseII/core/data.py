@@ -1,20 +1,3 @@
-"""
-data.py -- Phase II data utilities.
-
-Chịu trách nhiệm cho đúng hai việc, tách biệt rõ khỏi model/loss:
-  1. Chuyển (event_cycle hoặc censor_cycle) của từng engine thành nhãn hazard
-     theo bin thời gian rời rạc: y[t] = 1 tại đúng bin xảy ra sự kiện, 0 ở
-     mọi bin trước đó. Engine bị censor chỉ có toàn 0, dừng đúng chỗ quan sát
-     kết thúc -- KHÔNG suy đoán gì cho các bin sau đó.
-  2. Gói các chuỗi latent (độ dài khác nhau theo từng engine, đúng vì các
-     engine không đồng bộ) thành batch có padding, kèm mask để loss/metric
-     không bao giờ tính nhầm trên phần padding giả.
-
-Không có gì trong file này phụ thuộc vào kiến trúc model cụ thể (GRU/LSTM) --
-đây là lý do nó tách file riêng, đúng chuẩn "modular, no redundant coupling"
-đã thống nhất từ đầu.
-"""
-
 from dataclasses import dataclass
 import numpy as np
 
@@ -25,8 +8,7 @@ class EngineRecord:
     engine_id: str
     latent_seq: np.ndarray   # shape (T, latent_dim) -- output encoder Phase I, ĐÃ cắt tại [:event_bin+1] nếu có event
     n_bins: int              # số bin thực sự dùng = len(latent_seq); bằng event_bin+1 nếu có event
-    event_bin: int | None    # bin đầu tiên phát hiện degradation onset (0-indexed);
-                             # None nếu engine chưa vượt qua elbow trong cửa sổ quan sát (censored).
+    event_bin: int | None    # from z_drift
 
 
 def build_hazard_target(n_bins: int, event_bin: int | None) -> np.ndarray:

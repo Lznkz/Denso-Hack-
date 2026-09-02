@@ -1,108 +1,125 @@
 """
-prepare_data.py -- Chuẩn bị dữ liệu cho Phase II.
+prepare_data.py -- Chuẩn bị dữ liệu Phase II cho FD002.
 
 Input:
-    latent_data    : latent sequences từ encoder Phase I đã freeze.
-    train_metadata : metadata từ prepare_cmapss_split(), chứa is_extended.
+    latent_data      : dict[engine_id -> z_seq (n_bins, z_dim)], từ
+                        train.extract_latents_for_engine (Phase I đã freeze).
+    true_failure_bin : dict[engine_id -> int], CHỈ chứa các engine thuộc
+                        nhóm "giữ nguyên, không cắt" -- bin cuối cùng
+                        trong latent_seq của chính engine đó, tương ứng
+                        đúng cycle hỏng THẬT (dòng cuối chuỗi gốc FD002,
+                        vì train_FD002.txt vốn dĩ là run-to-failure).
+                        Engine KHÔNG có mặt trong dict này => censored.
 
 Nhiệm vụ:
-    1. Xác định event_bin cho từng engine dựa trên is_extended:
-       - Extended engine: event_bin = n_bins - 1 (bin cuối — engine được
-         quan sát đến khi có dấu hiệu suy thoái, bin đó chính là event).
-       - Normal engine: event_bin = None (censored — chưa vượt qua elbow).
-    2. Build EngineRecord từ latent_seq + event_bin.
-    3. Stratified split train / val giữ tỉ lệ extended/normal.
-
-Phase II KHÔNG train lại encoder Phase I.
+    1. Build EngineRecord: event_bin lấy TRỰC TIẾP từ true_failure_bin
+       nếu có -- KHÔNG suy đoán qua z_drift/threshold (đây là nhãn THẬT,
+       biết chắc, khác hẳn cách tiếp cận dùng ngưỡng tự phát hiện).
+    2. Cắt latent_seq tại [:event_bin+1] cho engine có event -- đúng
+       trách nhiệm caller mà data.py Phase II yêu cầu.
+    3. Stratified split train/val giữ tỉ lệ event/censored, có phòng hờ
+       khi nhóm "event" quá ít (thường chỉ vài engine với FD002).
 """
-
 import numpy as np
 
 from src.phaseII.core.data import EngineRecord
 
 
 # ============================================================
-# BƯỚC 2 — Build EngineRecord
+# BƯỚC 1-2 — Build EngineRecord từ nhãn THẬT (không suy đoán)
 # ============================================================
 
 def build_engine_records(
-    latent_data: dict[int, np.ndarray],
-    train_metadata: dict[int, dict],
+    latent_data: dict[str, np.ndarray],
+    true_failure_bin: dict[str, int],
 ) -> list[EngineRecord]:
     """
-    event_bin = bin cuối cùng của chính latent_seq engine đó, NẾU là
-    extended -- không tính lại từ elbow_cycle cố định.
-
-    Lý do: data.py đã ngẫu nhiên hóa độ dài quan sát cho từng engine rồi
-    (qua extended_max_extra). Dùng lại đúng độ dài đó làm event_bin, thay
-    vì áp một công thức chung, giữ được đúng sự đa dạng đã thiết kế và
-    tránh length trở thành shortcut lộ liễu cho model.
-
-    Về mặt ngữ nghĩa, điều này cũng khớp thực tế hơn: ta không thực sự
-    biết chính xác cycle nào là "elbow" -- ta chỉ biết "quan sát dừng lại
-    ở đây, và tại đây engine đã qua giai đoạn suy thoái" -- đúng như log
-    bảo trì thật chỉ cho biết thời điểm ghi nhận, không cho biết thời
-    điểm khởi phát chính xác.
+    true_failure_bin chỉ chứa engine thuộc nhóm "giữ nguyên" (không cắt).
+    Với các engine đó: event_bin = true_failure_bin[engine_id], đúng
+    nguyên văn cycle hỏng thật, không qua bất kỳ threshold/heuristic nào.
+    Mọi engine KHÔNG có mặt trong true_failure_bin bị coi là censored
+    (event_bin=None) -- đúng nhóm "log bình thường, bị cắt trước risk".
     """
     records = []
-    for engine_id, latent_seq in latent_data.items():
-        is_extended = train_metadata[engine_id]["is_extended"]
-        n_bins = latent_seq.shape[0]
-        event_bin = (n_bins - 1) if is_extended else None
+    for engine_id, z_seq in latent_data.items():
+        event_bin = true_failure_bin.get(engine_id)
 
-        records.append(
-            EngineRecord(
-                engine_id=str(engine_id),
-                latent_seq=latent_seq.astype(np.float32),
-                n_bins=n_bins,
-                event_bin=event_bin,
+        if event_bin is not None:
+            assert 0 <= event_bin < z_seq.shape[0], (
+                f"Engine {engine_id}: event_bin={event_bin} vượt quá "
+                f"độ dài latent_seq ({z_seq.shape[0]} bins)"
             )
-        )
+            latent_seq = z_seq[:event_bin + 1]
+            n_bins = event_bin + 1
+        else:
+            latent_seq = z_seq
+            n_bins = z_seq.shape[0]
+
+        records.append(EngineRecord(
+            engine_id=str(engine_id),
+            latent_seq=latent_seq.astype(np.float32),
+            n_bins=n_bins,
+            event_bin=event_bin,
+        ))
     return records
 
 
 # ============================================================
-# BƯỚC 3 — Stratified split
+# BƯỚC 3 — Stratified split, có phòng hờ nhóm event quá nhỏ
 # ============================================================
+
+def _split_group(group: list, train_ratio: float, rng: np.random.Generator):
+    """
+    Nếu group có ít hơn 2 phần tử, không thể chia có ý nghĩa -- đưa hết
+    vào train (cần ít nhất 1 mẫu event trong train để loss hazard có tác
+    dụng, xem thảo luận: nếu train_records không có event nào, hazard
+    loss không bao giờ được kích hoạt đúng phần quan trọng nhất).
+    """
+    if len(group) < 2:
+        if len(group) == 1:
+            warnings.warn(
+                "Chỉ có 1 mẫu trong nhóm này -- đưa vào train, "
+                "không có mẫu nào cho validation của riêng nhóm này."
+            )
+        return group, []
+
+    indices = np.arange(len(group))
+    rng.shuffle(indices)
+    n_train = max(1, int(len(group) * train_ratio))  # đảm bảo train có ít nhất 1
+    return (
+        [group[i] for i in indices[:n_train]],
+        [group[i] for i in indices[n_train:]],
+    )
+
 
 def split_train_val(
     records: list[EngineRecord],
-    train_metadata: dict[int, dict],
     train_ratio: float = 0.8,
     random_seed: int = 42,
 ):
     """
-    Stratified split giữ tỉ lệ extended/normal trong cả train lẫn val.
-
-    Extended engines (có event_bin) là positive examples duy nhất —
-    phải đảm bảo cả hai split đều có, không để toàn bộ lọt vào một bên.
+    Stratified split giữ tỉ lệ event/censored trong cả train lẫn val.
+    Với FD002, nhóm "event" (giữ nguyên) thường RẤT ÍT (vài engine) --
+    stratify càng quan trọng để không lỡ dồn hết vào 1 bên; _split_group
+    xử lý riêng trường hợp nhóm quá nhỏ để không chia ra 1 bên rỗng.
     """
     rng = np.random.default_rng(random_seed)
 
-    normal = [
-        r for r in records
-        if not train_metadata[int(r.engine_id)]["is_extended"]
-    ]
+    censored = [r for r in records if r.event_bin is None]
+    has_event = [r for r in records if r.event_bin is not None]
 
-    extended = [
-        r for r in records
-        if train_metadata[int(r.engine_id)]["is_extended"]
-    ]
-
-    def split_group(group):
-        indices = np.arange(len(group))
-        rng.shuffle(indices)
-        n_train = int(len(group) * train_ratio)
-        return (
-            [group[i] for i in indices[:n_train]],
-            [group[i] for i in indices[n_train:]],
+    if len(has_event) == 0:
+        warnings.warn(
+            "Không có engine nào có event_bin thật (true_failure_bin rỗng "
+            "hoặc không khớp latent_data) -- Phase II sẽ không train được "
+            "đúng ý nghĩa (hazard loss cần ít nhất 1 event trong train)."
         )
 
-    train_normal,   val_normal   = split_group(normal)
-    train_extended, val_extended = split_group(extended)
+    train_censored, val_censored = _split_group(censored, train_ratio, rng)
+    train_event, val_event = _split_group(has_event, train_ratio, rng)
 
-    train_records = train_normal + train_extended
-    val_records   = val_normal   + val_extended
+    train_records = train_censored + train_event
+    val_records = val_censored + val_event
 
     rng.shuffle(train_records)
     rng.shuffle(val_records)
@@ -115,20 +132,10 @@ def split_train_val(
 # ============================================================
 
 def prepare_training_data(
-    latent_data: dict[int, np.ndarray],
-    train_metadata: dict[int, dict],
+    latent_data: dict[str, np.ndarray],
+    true_failure_bin: dict[str, int],
     train_ratio: float = 0.8,
     random_seed: int = 42,
 ):
-
-    records = build_engine_records(
-        latent_data=latent_data,
-        train_metadata=train_metadata,
-    )
-
-    return split_train_val(
-        records=records,
-        train_metadata=train_metadata,
-        train_ratio=train_ratio,
-        random_seed=random_seed,
-    )
+    records = build_engine_records(latent_data, true_failure_bin)
+    return split_train_val(records, train_ratio=train_ratio, random_seed=random_seed)

@@ -7,9 +7,10 @@ sẵn sàng chạy, không cần sửa.
 import numpy as np
 import torch
 
-from core.windowing import EngineData
-from core.train import run_training, extract_latents_for_engine
-from core.metrics import z_drift_per_engine, fit_threshold, find_degradation_point, smooth_signal
+from demo.core.data import prepare_cmapss_split
+from src.phaseI.core.windowing import EngineData
+from src.phaseI.core.train import run_training, extract_latents_for_engine
+from src.phaseI.core.metrics import z_drift_per_engine, fit_threshold, find_degradation_point, smooth_signal
 
 
 CONFIG = {
@@ -27,25 +28,28 @@ CONFIG = {
 
 
 def load_engines() -> list[EngineData]:
-    """
-    ============================ ĐIỀN VÀO ĐÂY ============================
-    Dùng code chuẩn bị data bạn đã có sẵn (đọc file, tách X/W, chuẩn
-    hóa...), rồi đóng gói kết quả thành list[EngineData], mỗi engine 1
-    phần tử:
-
+    data = prepare_cmapss_split()
+    return [
         EngineData(
-            unit_number=...,   # int
-            X=...,             # (n_cycles, n_sensors), đã chuẩn hóa
-            W=...,             # (n_cycles, w_dim)
-            cycle=...,         # (n_cycles,) số cycle thật
+            unit_number=engine_id,
+            X=data["train_data"][engine_id],
+            W=data["train_op_data"][engine_id],
+            cycle=np.arange(1, len(data["train_data"][engine_id]) + 1),
         )
+        for engine_id in data["train_ids"]
+    ]
 
-    Trả về list chứa TẤT CẢ engine (train + validation gộp chung) --
-    việc chia train/val nằm ở hàm split_train_val() bên dưới, không cần
-    tự chia ở đây.
-    ========================================================================
-    """
-    raise NotImplementedError("Điền code chuẩn bị data của bạn vào đây")
+def normalize_engines(train_engines: list[EngineData], val_engines: list[EngineData]):
+    x = np.concatenate([engine.X for engine in train_engines])
+    w = np.concatenate([engine.W for engine in train_engines])
+    x_mean, x_std = x.mean(axis=0), x.std(axis=0)
+    w_mean, w_std = w.mean(axis=0), w.std(axis=0)
+    x_std[x_std < 1e-8] = 1.0
+    w_std[w_std < 1e-8] = 1.0
+
+    for engine in train_engines + val_engines:
+        engine.X = ((engine.X - x_mean) / x_std).astype(np.float32)
+        engine.W = ((engine.W - w_mean) / w_std).astype(np.float32)
 
 
 def split_train_val(engines: list[EngineData], val_fraction: float,
@@ -64,6 +68,7 @@ def main():
 
     all_engines = load_engines()
     train_engines, val_engines = split_train_val(all_engines, cfg["val_fraction"], cfg["seed"])
+    normalize_engines(train_engines, val_engines)
     print(f"{len(train_engines)} engine train, {len(val_engines)} engine validation")
 
     n_sensors = train_engines[0].X.shape[1]
