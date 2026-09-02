@@ -4,9 +4,6 @@ from pathlib import Path
 # Add project root to sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.phaseI.main import run_phase1
-from src.phaseII.main import run_phase2
-
 from demo.core.data import (
     SplitConfig,
     prepare_cmapss_split,
@@ -58,16 +55,3 @@ realtime = simulate_realtime(
 
 BIN_STRIDE = 10
 
-model, stats, normalized_data, latent_data = run_phase1(
-    train_data=data["train_data"],
-    n_sensors=len(data["sensors"]),
-    window_len=30,
-    latent_dim=16,
-    bin_stride=BIN_STRIDE,
-)
-
-gru_model, history = run_phase2(
-    latent_data=latent_data,
-    train_metadata=data["train_metadata"],
-    latent_dim=16,
-)
