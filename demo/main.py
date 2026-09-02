@@ -15,8 +15,8 @@ config = SplitConfig(
 
     train_ratio=0.70,
 
-    observation_cycle_min=130,
-    observation_cycle_max=135,
+    safety_margin_min=0.10,
+    safety_margin_max=0.20,
 
     rare_fault_probability=0.20,
     rare_fault_max_duration=10,
