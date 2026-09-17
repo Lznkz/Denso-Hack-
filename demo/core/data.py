@@ -50,12 +50,12 @@ class SplitConfig:
     # TRAIN / TEST split
     train_ratio: float = 0.70
 
-    # TRAIN observation boundary
-    observation_cycle_min: int = 130
-    observation_cycle_max: int = 135
+    # TRAIN observation safety margin (% of total cycles)
+    safety_margin_min: float = 0.15
+    safety_margin_max: float = 0.25
 
     # Rare abnormal trajectory simulation
-    rare_fault_probability: float = 0.20
+    rare_fault_probability: float = 0
     rare_fault_max_duration: int = 10
     rare_fault_start_cycle_min: int = 60
     rare_fault_magnitude_min: float = 0.03
@@ -149,14 +149,12 @@ def sample_observation_cutoff(
     rng: np.random.Generator,
 ) -> int:
     """
-    Sample the observation cutoff for a training engine.
+    Sample observation cutoff based on random safety margin [10%, 20%].
+    Simulates real factory preventative maintenance stopping engines before failure.
     """
-    target_cycle = rng.integers(
-        config.observation_cycle_min,
-        config.observation_cycle_max + 1,
-    )
-    cutoff = min(target_cycle, n_cycles)
-    return max(1, cutoff)
+    margin_ratio = rng.uniform(config.safety_margin_min, config.safety_margin_max)
+    cutoff = int(np.floor(n_cycles * (1.0 - margin_ratio)))
+    return max(1, min(cutoff, n_cycles - 1))
 
 
 # ============================================================

@@ -82,6 +82,84 @@ quantifying the uncertainty.
 - The data maybe provide at form of minute, second ...
 *** The engine won't behave the same after getting maintainance
 *** Operational Condition plays a critical role
+** Simulate data
+*** The data for 1 type of *Engine* : Pallet transfer conveyor drive unit & *Fault* : Bearing wear
+*** Need to embed some relationship between the data : X, W, Z
+*** W will include : warmup, working, maintenance, down-time
+Với er unit của pallet conveyor (motor + gearbox/pulley + bearing), một chu kỳ thực tế trong nhà máy lắp ráp/phụ tùng ô tô (line chạy theo ca, có buffer, có PM định kỳ) thường có các state sau — mỗi state có duty cycle và "chữ ký" tín hiệu riêng:
+
+Idlendby — motor có điện nhưng không quay hoặc quay không tải (chờ pallet
+tới)bration baseline thấp, dòng điện motor gần no-load current.
+
+Warm/ Start-up transient — vài giây đến vài phút đầu ca hoặc sau break dài.
+Dòngn inrush cao, nhiệt độ bearing/motor tăng dần từ nhiệt độ phòng lên
+steatate, vibration có transient (do lubricant còn nhớt/lạnh, khe hở nhiệt
+chưađịnh).
+
+WorkLoaded (steady-state) — pallet có tải di chuyển, đây là state chiếm phần
+lớn  gian vận hành, dòng điện và vibration RMS tỉ lệ với tải (trọng lượng
+pallma sát) và tốc độ băng tải.
+
+Loadying transient (tùy mức độ chi tiết bạn muốn) — pallet nặng/nhẹ khác
+nhau từng chu kỳ tạo ra biến thiên tải theo phân phối chứ không cố định.
+
+Sched maintenance / lubrication — dừng máy có kế hoạch, sau đó tín hiệu có
+thể et" một phần (bôi trơn lại làm giảm ma sát tạm thời — đây là điểm quan
+trọnM không reset hoàn toàn wear, chỉ giảm một số triệu chứng như nhiệt độ
+và mt, KHÔNG làm giảm defect đã hình thành trên raceway).  Unplanned
+down/fault stop — máy dừng đột ngột do lỗi (bearing wear tới ngưỡng, hoặc
+lỗi  không liên quan). Đây là điểm kết thúc run-to-failure nếu bạn build dữ
+liệuu đó.
+
+Gợi ùng semi-Markov chain với duration phân phối theo state (ví dụ working ~
+phâni lognormal quanh vài phút–vài chục phút, idle ~ ngắn hơn, warmup ~ cố
+địnhn) thay vì random switch mỗi timestep — thực tế nhà máy có nhịp ca rõ
+ràngkt time).
+*** P-F curve to refer :
+Theo domain knowledge chuẩn về degradation của rolling-element bearing, có 5
+giai đoạn: bearing khỏe mạnh chỉ có tần số quay cơ bản, giai đoạn 0 là dầu bôi
+trơn bắt đầu mỏng đi (chỉ thấy ở tần số siêu âm, thường không đo được ở công
+nghiệp), giai đoạn 1 là thiếu bôi trơn làm tăng ma sát và xuất hiện nhiễu ở vùng
+tần số tự nhiên, giai đoạn 2 là fault thực sự phát triển với tần số fault đặc
+trưng xuất hiện rõ, và giai đoạn 3 là hỏng hoàn toàn.
+
+Từ đó, sensor set tối thiểu nên có:
+
+Vibration (accelerometer): RMS, kurtosis, crest factor (peak/RMS), và optionally
+envelope spectrum energy tại BPFO/BPFI (tùy bạn có muốn mô phỏng tới mức tần số
+hay chỉ feature thống kê). Lưu ý: crest factor có xu hướng đặc trưng: ban đầu tỷ
+lệ đỉnh/RMS tương đối ổn định, sau đó khi bearing xuống cấp thì càng nhiều xung
+được sinh ra mỗi vòng quay, ảnh hưởng dần đến giá trị RMS dù biên độ từng xung
+riêng lẻ không tăng thêm — nghĩa là kurtosis/crest factor tăng sớm rồi giảm lại
+gần failure (RMS bắt đầu áp đảo), đây là chi tiết hay bị bỏ qua khi simulate
+(nhiều người chỉ cho tăng tuyến tính, không thực tế).
+
+Motor current (RMS + có thể vài harmonic): MCSA — mọi bất thường cơ khí trong
+drive train, từ răng bánh răng mòn tới lệch băng tải, đều tạo ra chữ ký điện
+tương ứng trong dạng sóng dòng điện motor. Với conveyor cụ thể, cấu hình sensor
+phổ biến nhất là dòng điện, nhiệt độ và vibration đặt tại motor để theo dõi load
+pattern, xu hướng nhiệt và độ lệch trục.
+
+Nhiệt độ bearing/motor housing: tăng chậm và có trễ pha so với vibration (nhiệt
+là hệ quả tích lũy của ma sát, phản ứng chậm hơn).
+
+Tốc độ/RPM (encoder) — dùng làm operational condition, không phải fault
+indicator, nhưng cần thiết để normalize các feature khác (vì defect frequency và
+amplitude phụ thuộc tốc độ).
+
+Load/current-derived load estimate — đại diện cho operational condition (trọng
+lượng pallet).
+*** We need to really careful in data simulation, also need to check for things that can ignore (the sample was damaged faster)
+**** Gamma Process
+:PROPERTIES:
+:ID:       9e767795-5bb7-485f-b531-0e69c021769f
+:END:
+**** Archad's Wear
+**** Kurtosis
+**** Crest Factor
+**** Milestone
+**** [ ] The data will correlation with the W (high load will cause aall faster)
+**** [ ] Degradation Dynamic (The speed ~ [[id:9e767795-5bb7-485f-b531-0e69c021769f][Gamma Process]], the correlation )
 ** Potential Question
 *** Why for Tier 2/3
 :PROPERTIES:
@@ -279,3 +357,4 @@ $$\text{Loss}_t = -[y_t \log(\hat{y}_t) + (1 - y_t) \log(1 - \hat{y}_t)]$$
 *** [ ] Attention GRU
 *** [ ] What if we don't have Operational Conditions ?
 *** [ ] OC can be different in CMAPSS and DENSO ...
+
