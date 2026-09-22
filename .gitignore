@@ -1,5 +1,11 @@
+<<<<<<< HEAD
 __pycache__/
 *.py[cod]
 
 # Dữ liệu sinh ra từ export_data
 demo/data/exported_data/
+=======
+__pycache__
+.venv/
+src/processed_data/
+>>>>>>> origin/test1

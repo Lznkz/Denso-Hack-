@@ -51,11 +51,16 @@ class SplitConfig:
     train_ratio: float = 0.70
 
     # TRAIN observation safety margin (% of total cycles)
+<<<<<<< HEAD
     safety_margin_min: float = 0.10
     safety_margin_max: float = 0.20
+=======
+    safety_margin_min: float = 0.15
+    safety_margin_max: float = 0.25
+>>>>>>> origin/test1
 
     # Rare abnormal trajectory simulation
-    rare_fault_probability: float = 0.20
+    rare_fault_probability: float = 0
     rare_fault_max_duration: int = 10
     rare_fault_start_cycle_min: int = 60
     rare_fault_magnitude_min: float = 0.03
