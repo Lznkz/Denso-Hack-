@@ -1,11 +1,84 @@
-<<<<<<< HEAD
+# ==========================================
+# Byte-compiled / optimized / DLL files
+# ==========================================
 __pycache__/
 *.py[cod]
+*$py.class
 
-# Dữ liệu sinh ra từ export_data
-demo/data/exported_data/
-=======
-__pycache__
+# ==========================================
+# Virtual Environments & Packages
+# ==========================================
 .venv/
+venv/
+env/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ==========================================
+# Testing & Code Quality
+# ==========================================
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# ==========================================
+# Jupyter Notebooks
+# ==========================================
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+
+# ==========================================
+# Environment Variables & Secrets
+# ==========================================
+.env
+.env.*
+!.env.example
+
+# ==========================================
+# IDE & OS Specific
+# ==========================================
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ==========================================
+# Project Specific: Datasets, Caches & Exports
+# ==========================================
+# Demo & processed data
+demo/data/exported_data/
 src/processed_data/
->>>>>>> origin/test1
+test_Weiner/
+# Model weights & large binaries
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.onnx
+*.safetensors
+
+# Compressed archives
+*.zip
+*.tar.gz
+*.rar
+*.7z

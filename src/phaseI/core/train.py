@@ -1,3 +1,41 @@
+"""
+train.py
+
+Training loop cho Phase I / HI branch sau SPEV preprocessing moi.
+
+Data contract
+-------------
+Moi row cua EngineData la dung MOT measurement:
+
+    X:     (N_measurements, n_channels, n_spev_buckets)
+    W:     (N_measurements, w_dim)
+    cycle: (N_measurements,)   # ten legacy, thuc chat measurement_id
+
+Normalization da duoc windowing.py xu ly:
+
+    X_raw -> log1p -> StandardScaler(train bearings)
+    W_raw -> StandardScaler(train bearings)
+
+Model contract
+--------------
+    X_tilde -> Encoder -> Z
+    (Z, W_tilde) -> Decoder -> X_hat_tilde
+
+Phase I co dinh:
+    z_dim = 1
+
+Loss contract
+-------------
+    L = MAE(X_hat_tilde, X_tilde) + lambda_ng * L_NG
+
+Theo quy uoc Bajarunas dang dung trong loss.py:
+    Z khong duoc tang theo thoi gian (dZ/dt <= 0).
+
+Temporal loss chi noi cac measurement co measurement_id lien tiep.
+Khong con healthy baseline, latent-distance loss, trend, variance,
+covariance hay smoothness trong training loop.
+"""
+
 import numpy as np
 import torch
 
@@ -6,231 +44,282 @@ from src.phaseI.core.model import SmartConv1DAutoencoder
 from src.phaseI.core.loss import smart_ae_loss
 
 
-SUBWINDOWS_PER_MEASUREMENT = 25
+Z_DIM = 1
 
 
-def _to_model_layout(x: torch.Tensor) -> torch.Tensor:
-    return x.transpose(1, 2)
+# ============================================================
+# VALIDATION
+# ============================================================
 
+def _validate_engine_structure(
+    engine: EngineData,
+) -> None:
+    """Validate contract moi ma khong materialize toan bo X."""
 
-def _validate_engine_structure(engine: EngineData) -> None:
-    n_x = len(engine.X)
-    n_w = len(engine.W)
-    n_cycle = len(engine.cycle)
-
-    if n_x != n_w or n_x != n_cycle:
+    if engine.X.ndim != 3:
         raise ValueError(
-            f"{engine.unit_number}: X/W/cycle không cùng số dòng: "
-            f"X={n_x}, W={n_w}, cycle={n_cycle}"
+            f"{engine.unit_number}: X phai co shape "
+            "(N_measurements, channels, SPEV_buckets), "
+            f"got {engine.X.shape}"
         )
 
-    if n_x % SUBWINDOWS_PER_MEASUREMENT != 0:
+    n = len(engine.X)
+
+    if n == 0:
         raise ValueError(
-            f"{engine.unit_number}: số sub-window={n_x} không chia hết cho "
-            f"{SUBWINDOWS_PER_MEASUREMENT}."
+            f"{engine.unit_number}: khong co measurement."
         )
 
-    cycle = np.asarray(engine.cycle)
-    cycle_grouped = cycle.reshape(-1, SUBWINDOWS_PER_MEASUREMENT)
+    W = np.asarray(engine.W)
+    measurement_ids = np.asarray(engine.cycle)
 
-    if not np.all(cycle_grouped == cycle_grouped[:, :1]):
+    if W.ndim != 2:
         raise ValueError(
-            f"{engine.unit_number}: measurement_id không được nhóm liên tiếp "
-            f"theo block {SUBWINDOWS_PER_MEASUREMENT} sub-window."
+            f"{engine.unit_number}: W phai co shape "
+            f"(N_measurements, w_dim), got {W.shape}"
         )
 
-
-def _mean_pool_z(
-    z: torch.Tensor,
-    cycle: np.ndarray,
-) -> tuple[torch.Tensor, np.ndarray]:
-    n = z.shape[0]
-
-    if n % SUBWINDOWS_PER_MEASUREMENT != 0:
+    if measurement_ids.ndim != 1:
         raise ValueError(
-            f"Batch có {n} sub-window, không chia hết cho "
-            f"{SUBWINDOWS_PER_MEASUREMENT}."
+            f"{engine.unit_number}: measurement_id phai 1D, "
+            f"got {measurement_ids.shape}"
         )
 
-    cycle = np.asarray(cycle)
-    cycle_grouped = cycle.reshape(-1, SUBWINDOWS_PER_MEASUREMENT)
-
-    if not np.all(cycle_grouped == cycle_grouped[:, :1]):
+    if not (
+        len(W) == n
+        and len(measurement_ids) == n
+    ):
         raise ValueError(
-            "Batch đang cắt ngang measurement hoặc measurement_id "
-            "không được xếp liên tiếp."
+            f"{engine.unit_number}: X/W/measurement_id khac so dong: "
+            f"X={n}, W={len(W)}, measurement_id={len(measurement_ids)}"
         )
 
-    n_measurements = cycle_grouped.shape[0]
-    z_grouped = z.reshape(
-        n_measurements,
-        SUBWINDOWS_PER_MEASUREMENT,
-        z.shape[-1],
+    if not np.isfinite(W).all():
+        raise ValueError(
+            f"{engine.unit_number}: W chua NaN/Inf"
+        )
+
+    # Moi measurement chi co mot row. Cho phep gap, nhung khong cho
+    # duplicate hay dao thu tu thoi gian.
+    if n > 1 and not np.all(
+        measurement_ids[1:] > measurement_ids[:-1]
+    ):
+        raise ValueError(
+            f"{engine.unit_number}: measurement_id phai tang nghiem ngat."
+        )
+
+    # Sanity-check mot sample normalized X, tranh materialize ca bearing.
+    x_sample = np.asarray(
+        engine.X[0],
+        dtype=np.float32,
     )
-    z_mean = z_grouped.mean(dim=1)
-    measurement_id = cycle_grouped[:, 0]
 
-    return z_mean, measurement_id
+    expected_shape = (
+        int(engine.X.shape[1]),
+        int(engine.X.shape[2]),
+    )
 
+    if x_sample.shape != expected_shape:
+        raise ValueError(
+            f"{engine.unit_number}: X sample shape={x_sample.shape}, "
+            f"expected={expected_shape}"
+        )
+
+    if not np.isfinite(x_sample).all():
+        raise ValueError(
+            f"{engine.unit_number}: X sample dau tien chua NaN/Inf"
+        )
+
+
+# ============================================================
+# TEMPORAL ADJACENCY
+# ============================================================
 
 def _build_measurement_mask(
-    n_measurements: int,
+    measurement_ids: np.ndarray,
     device: str,
 ) -> torch.Tensor:
-    return torch.ones(
-        max(n_measurements - 1, 0),
+    """
+    Chi cho L_NG noi hai measurement thuc su lien tiep.
+
+    Vi du:
+        measurement_id = [51, 52, 53, 55]
+        mask           = [ T,  T,  F]
+    """
+
+    measurement_ids = np.asarray(measurement_ids)
+
+    if measurement_ids.ndim != 1:
+        raise ValueError(
+            "measurement_ids phai la mang 1D."
+        )
+
+    if len(measurement_ids) <= 1:
+        return torch.zeros(
+            0,
+            dtype=torch.bool,
+            device=device,
+        )
+
+    mask = (
+        measurement_ids[1:]
+        == measurement_ids[:-1] + 1
+    )
+
+    return torch.as_tensor(
+        mask,
         dtype=torch.bool,
         device=device,
     )
 
 
-def _prepare_epoch_batches(
+# ============================================================
+# CONTIGUOUS MEASUREMENT BATCHES
+# ============================================================
+
+def _build_batch_specs(
     engines: list[EngineData],
     batch_size: int,
-    rng: np.random.Generator,
-) -> list[WindowBatch]:
-    if batch_size % SUBWINDOWS_PER_MEASUREMENT != 0:
+) -> list[tuple[int, int, int]]:
+    """
+    Tao contiguous measurement blocks cua tung bearing.
+
+    Chi shuffle thu tu cac block; thu tu measurement ben trong block
+    luon duoc giu de L_NG co nghia theo thoi gian.
+    """
+
+    if batch_size <= 0:
         raise ValueError(
-            f"batch_size={batch_size} phải là bội số của "
-            f"{SUBWINDOWS_PER_MEASUREMENT}."
+            f"batch_size phai > 0, got {batch_size}"
         )
 
-    batches = []
+    specs: list[tuple[int, int, int]] = []
 
-    for engine in engines:
-        _validate_engine_structure(engine)
+    for engine_idx, engine in enumerate(engines):
         n = len(engine.X)
 
         for start in range(0, n, batch_size):
             end = min(start + batch_size, n)
-
-            if (end - start) % SUBWINDOWS_PER_MEASUREMENT != 0:
-                raise ValueError(
-                    f"{engine.unit_number}: batch [{start}:{end}] "
-                    f"cắt ngang measurement."
-                )
-
-            batches.append(
-                WindowBatch(
-                    X=engine.X[start:end],
-                    W=engine.W[start:end],
-                    unit_number=np.full(
-                        end - start,
-                        engine.unit_number,
-                        dtype=object,
-                    ),
-                    cycle=engine.cycle[start:end],
+            specs.append(
+                (
+                    engine_idx,
+                    int(start),
+                    int(end),
                 )
             )
 
-    order = rng.permutation(len(batches))
-    return [batches[i] for i in order]
+    return specs
 
 
-@torch.no_grad()
-def _compute_engine_baseline(
-    model: SmartConv1DAutoencoder,
-    engine: EngineData,
-    device: str,
-    n_baseline_bins: int = 5,
-) -> torch.Tensor:
-    _validate_engine_structure(engine)
-
-    n_total_measurements = len(engine.X) // SUBWINDOWS_PER_MEASUREMENT
-    n_baseline = min(n_baseline_bins, n_total_measurements)
-
-    if n_baseline <= 0:
-        raise ValueError(f"{engine.unit_number}: không có measurement để tạo baseline.")
-
-    n_subwindows = n_baseline * SUBWINDOWS_PER_MEASUREMENT
-
-    x = torch.from_numpy(
-        np.asarray(engine.X[:n_subwindows])
-    ).float().to(device)
-
-    x_model = _to_model_layout(x)
-    z = model.encode(x_model)
-
-    z_measurement = z.reshape(
-        n_baseline,
-        SUBWINDOWS_PER_MEASUREMENT,
-        z.shape[-1],
-    ).mean(dim=1)
-
-    return z_measurement.mean(dim=0).detach()
-
-
-@torch.no_grad()
-def _compute_baselines(
-    model: SmartConv1DAutoencoder,
+def _iter_epoch_batches(
     engines: list[EngineData],
-    device: str,
-    n_baseline_bins: int,
-) -> dict[object, torch.Tensor]:
-    baselines = {}
+    batch_size: int,
+    rng: np.random.Generator,
+):
+    specs = _build_batch_specs(
+        engines=engines,
+        batch_size=batch_size,
+    )
 
-    for engine in engines:
-        baselines[engine.unit_number] = _compute_engine_baseline(
-            model=model,
-            engine=engine,
-            device=device,
-            n_baseline_bins=n_baseline_bins,
+    order = rng.permutation(len(specs))
+
+    for idx in order:
+        engine_idx, start, end = specs[int(idx)]
+        engine = engines[engine_idx]
+
+        yield WindowBatch(
+            X=np.asarray(
+                engine.X[start:end],
+                dtype=np.float32,
+            ),
+            W=np.asarray(
+                engine.W[start:end],
+                dtype=np.float32,
+            ),
+            unit_number=np.full(
+                end - start,
+                engine.unit_number,
+                dtype=object,
+            ),
+            cycle=np.asarray(
+                engine.cycle[start:end]
+            ),
         )
 
-    return baselines
 
+# ============================================================
+# BATCH LOSS
+# ============================================================
 
 def _compute_batch_losses(
     model: SmartConv1DAutoencoder,
     batch: WindowBatch,
-    baseline_by_engine: dict[object, torch.Tensor],
     device: str,
-    lambda_mono: float,
-    lambda_anticollapse: float,
-    lambda_smooth: float,
-    min_std: float,
-    w_dropout_p: float,
+    lambda_ng: float,
 ) -> dict[str, torch.Tensor]:
-    x = torch.from_numpy(np.asarray(batch.X)).float().to(device)
-    w = torch.from_numpy(np.asarray(batch.W)).float().to(device)
+    """Forward mot contiguous measurement block va tinh MAE + NG."""
 
-    x_model = _to_model_layout(x)
-
-    x_hat, z = model(
-        x_model,
-        w,
-        w_dropout_p=w_dropout_p,
+    x = torch.from_numpy(
+        np.asarray(
+            batch.X,
+            dtype=np.float32,
+        )
+    ).to(
+        device=device,
+        dtype=torch.float32,
     )
 
-    z_mean, _ = _mean_pool_z(z, batch.cycle)
+    w = torch.from_numpy(
+        np.asarray(
+            batch.W,
+            dtype=np.float32,
+        )
+    ).to(
+        device=device,
+        dtype=torch.float32,
+    )
 
+    if x.ndim != 3:
+        raise ValueError(
+            f"batch.X phai 3D, got {tuple(x.shape)}"
+        )
+
+    if w.ndim != 2 or w.shape[0] != x.shape[0]:
+        raise ValueError(
+            "batch.W phai co shape (batch, w_dim) va cung batch size voi X."
+        )
+
+    # Moi batch duoc tao tu dung mot bearing.
     unique_units = np.unique(batch.unit_number)
     if len(unique_units) != 1:
         raise ValueError(
-            "Một batch phải thuộc đúng 1 bearing để temporal loss có nghĩa."
+            "Mot batch phai thuoc dung mot bearing."
         )
 
-    unit = unique_units[0]
-    baseline_value = baseline_by_engine[unit]
-    baseline = baseline_value.unsqueeze(0).expand_as(z_mean)
+    x_hat, z = model(x, w)
+
+    if z.ndim != 2 or z.shape[1] != Z_DIM:
+        raise RuntimeError(
+            f"Phase I yeu cau Z shape (N,{Z_DIM}), got {tuple(z.shape)}"
+        )
 
     same_engine_mask = _build_measurement_mask(
-        n_measurements=z_mean.shape[0],
+        measurement_ids=batch.cycle,
         device=device,
     )
 
     return smart_ae_loss(
         x_hat=x_hat,
-        x=x_model,
-        z_seq=z_mean,
-        baseline=baseline,
+        x=x,
+        z_seq=z,
         same_engine_mask=same_engine_mask,
-        lambda_mono=lambda_mono,
-        lambda_anticollapse=lambda_anticollapse,
-        lambda_smooth=lambda_smooth,
-        min_std=min_std,
+        lambda_ng=lambda_ng,
     )
 
+
+# ============================================================
+# EVALUATION
+# ============================================================
 
 @torch.no_grad()
 def _evaluate(
@@ -238,99 +327,171 @@ def _evaluate(
     engines: list[EngineData],
     batch_size: int,
     device: str,
-    lambda_mono: float,
-    lambda_anticollapse: float,
-    lambda_smooth: float,
-    n_baseline_bins: int,
-    min_std: float,
-    rng: np.random.Generator,
-) -> float:
+    lambda_ng: float,
+) -> dict[str, float]:
     model.eval()
 
-    baseline_by_engine = _compute_baselines(
-        model=model,
-        engines=engines,
-        device=device,
-        n_baseline_bins=n_baseline_bins,
-    )
+    totals = {
+        "total": 0.0,
+        "recon": 0.0,
+        "ng": 0.0,
+    }
+    n_batches = 0
 
-    batches = _prepare_epoch_batches(
+    # Validation khong can random order. De deterministic va de doc log.
+    rng = np.random.default_rng(0)
+
+    for batch in _iter_epoch_batches(
         engines=engines,
         batch_size=batch_size,
         rng=rng,
-    )
-
-    total_loss = 0.0
-    n_batches = 0
-
-    for batch in batches:
+    ):
         losses = _compute_batch_losses(
             model=model,
             batch=batch,
-            baseline_by_engine=baseline_by_engine,
             device=device,
-            lambda_mono=lambda_mono,
-            lambda_anticollapse=lambda_anticollapse,
-            lambda_smooth=lambda_smooth,
-            min_std=min_std,
-            w_dropout_p=0.0,
+            lambda_ng=lambda_ng,
         )
 
-        total_loss += losses["total"].item()
+        for key in totals:
+            totals[key] += float(
+                losses[key].item()
+            )
+
         n_batches += 1
 
-    return total_loss / max(n_batches, 1)
+    if n_batches == 0:
+        raise RuntimeError(
+            "Khong tao duoc validation batch."
+        )
 
+    return {
+        key: value / n_batches
+        for key, value in totals.items()
+    }
+
+
+# ============================================================
+# TRAIN
+# ============================================================
 
 def run_training(
     engines: list[EngineData],
-    n_sensors: int,
-    w_dim: int,
-    window_len: int,
     val_engines: list[EngineData] | None = None,
-    batch_size: int = 200,
-    z_dim: int = 4,
-    hidden_channels: tuple[int, int] = (16, 8),
+    batch_size: int = 128,
+    hidden_channels: tuple[int, ...] = (
+        32,
+        16,
+        8,
+    ),
     n_epochs: int = 50,
     lr: float = 1e-3,
     seed: int = 0,
     device: str = "cpu",
-    lambda_mono: float = 1.0,
-    lambda_anticollapse: float = 1.0,
-    lambda_smooth: float = 0.0,
-    n_baseline_bins: int = 5,
-    min_std: float = 0.1,
-    w_dropout_start: float = 0.0,
-    w_dropout_end: float = 0.0,
-    w_dropout_epochs: int = 0,
+    lambda_ng: float = 1.0,
     patience: int = 5,
     min_delta: float = 1e-5,
+    grad_clip: float | None = 5.0,
 ) -> SmartConv1DAutoencoder:
-    if batch_size % SUBWINDOWS_PER_MEASUREMENT != 0:
+    """
+    Train conditional AE voi scalar latent Z.
+
+    ``z_dim`` khong con la hyperparameter: Phase I co dinh Z_DIM = 1.
+    W luon duoc dua vao decoder.
+    """
+
+    if not engines:
         raise ValueError(
-            f"batch_size={batch_size} phải là bội số của "
-            f"{SUBWINDOWS_PER_MEASUREMENT}."
+            "Khong co training engine."
+        )
+
+    if batch_size <= 0:
+        raise ValueError(
+            "batch_size phai > 0."
+        )
+
+    if n_epochs <= 0:
+        raise ValueError(
+            "n_epochs phai > 0."
+        )
+
+    if lr <= 0:
+        raise ValueError(
+            "lr phai > 0."
+        )
+
+    if lambda_ng < 0:
+        raise ValueError(
+            "lambda_ng phai >= 0."
         )
 
     for engine in engines:
         _validate_engine_structure(engine)
 
-    if val_engines is not None:
+    if val_engines:
         for engine in val_engines:
             _validate_engine_structure(engine)
 
+    first = engines[0]
+
+    n_sensors = int(first.X.shape[1])
+    n_buckets = int(first.X.shape[2])
+    w_dim = int(first.W.shape[1])
+
+    def _check_contract(
+        engine: EngineData,
+    ) -> None:
+        if engine.X.shape[1] != n_sensors:
+            raise ValueError(
+                f"{engine.unit_number}: n_sensors={engine.X.shape[1]}, "
+                f"expected={n_sensors}"
+            )
+
+        if engine.X.shape[2] != n_buckets:
+            raise ValueError(
+                f"{engine.unit_number}: n_buckets={engine.X.shape[2]}, "
+                f"expected={n_buckets}"
+            )
+
+        if engine.W.shape[1] != w_dim:
+            raise ValueError(
+                f"{engine.unit_number}: w_dim={engine.W.shape[1]}, "
+                f"expected={w_dim}"
+            )
+
+    for engine in engines:
+        _check_contract(engine)
+
+    if val_engines:
+        for engine in val_engines:
+            _check_contract(engine)
+
+    print(
+        "Model input: "
+        f"X=(batch,{n_sensors},{n_buckets}), "
+        f"W=(batch,{w_dim}), "
+        f"Z=(batch,{Z_DIM})"
+    )
+
     torch.manual_seed(seed)
 
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
     rng = np.random.default_rng(seed)
-    val_rng = np.random.default_rng(seed + 1)
 
     model = SmartConv1DAutoencoder(
         n_sensors=n_sensors,
-        window_len=window_len,
+        window_len=n_buckets,  # model.py giu ten legacy window_len
         w_dim=w_dim,
-        z_dim=z_dim,
+        z_dim=Z_DIM,
         hidden_channels=hidden_channels,
     ).to(device)
+
+    if model.z_dim != Z_DIM:
+        raise RuntimeError(
+            f"Model phai co z_dim={Z_DIM}."
+        )
 
     optimizer = torch.optim.Adam(
         model.parameters(),
@@ -342,110 +503,112 @@ def run_training(
     best_state = None
 
     for epoch in range(n_epochs):
-        model.eval()
-        baseline_by_engine = _compute_baselines(
-            model=model,
-            engines=engines,
-            device=device,
-            n_baseline_bins=n_baseline_bins,
-        )
-
         model.train()
-
-        if w_dropout_epochs > 0:
-            progress = min(epoch / w_dropout_epochs, 1.0)
-        else:
-            progress = 1.0
-
-        w_dropout_p = (
-            w_dropout_start
-            + progress * (w_dropout_end - w_dropout_start)
-        )
-
-        batches = _prepare_epoch_batches(
-            engines=engines,
-            batch_size=batch_size,
-            rng=rng,
-        )
 
         epoch_losses = {
             "total": 0.0,
             "recon": 0.0,
-            "mono": 0.0,
-            "anticollapse": 0.0,
-            "smooth": 0.0,
+            "ng": 0.0,
         }
-
         n_batches = 0
 
-        for batch in batches:
-            optimizer.zero_grad()
+        for batch in _iter_epoch_batches(
+            engines=engines,
+            batch_size=batch_size,
+            rng=rng,
+        ):
+            optimizer.zero_grad(
+                set_to_none=True
+            )
 
             losses = _compute_batch_losses(
                 model=model,
                 batch=batch,
-                baseline_by_engine=baseline_by_engine,
                 device=device,
-                lambda_mono=lambda_mono,
-                lambda_anticollapse=lambda_anticollapse,
-                lambda_smooth=lambda_smooth,
-                min_std=min_std,
-                w_dropout_p=w_dropout_p,
+                lambda_ng=lambda_ng,
             )
 
             losses["total"].backward()
+
+            if grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    max_norm=grad_clip,
+                )
+
             optimizer.step()
 
             for key in epoch_losses:
-                epoch_losses[key] += losses[key].item()
+                epoch_losses[key] += float(
+                    losses[key].item()
+                )
 
             n_batches += 1
 
-        log = " | ".join(
-            f"{key}={value / max(n_batches, 1):.6f}"
-            for key, value in epoch_losses.items()
-        )
-        log += f" | w_dropout_p={w_dropout_p:.3f}"
+        if n_batches == 0:
+            raise RuntimeError(
+                "Khong tao duoc training batch."
+            )
 
-        if val_engines is not None:
-            val_loss = _evaluate(
+        train_avg = {
+            key: value / n_batches
+            for key, value in epoch_losses.items()
+        }
+
+        train_log = " | ".join(
+            f"{key}={value:.6f}"
+            for key, value in train_avg.items()
+        )
+
+        if val_engines:
+            val_avg = _evaluate(
                 model=model,
                 engines=val_engines,
                 batch_size=batch_size,
                 device=device,
-                lambda_mono=lambda_mono,
-                lambda_anticollapse=lambda_anticollapse,
-                lambda_smooth=lambda_smooth,
-                n_baseline_bins=n_baseline_bins,
-                min_std=min_std,
-                rng=val_rng,
+                lambda_ng=lambda_ng,
+            )
+
+            val_log = " | ".join(
+                f"val_{key}={value:.6f}"
+                for key, value in val_avg.items()
             )
 
             print(
-                f"epoch {epoch:3d} | "
-                f"{log} | "
-                f"val_total={val_loss:.6f}"
+                f"epoch {epoch + 1:03d} | "
+                f"{train_log} | {val_log}"
             )
 
-            if best_val_loss - val_loss > min_delta:
+            val_loss = val_avg["total"]
+
+            if (
+                best_val_loss - val_loss
+                > min_delta
+            ):
                 best_val_loss = val_loss
                 epochs_without_improvement = 0
                 best_state = {
-                    k: v.detach().cpu().clone()
-                    for k, v in model.state_dict().items()
+                    key: value.detach().cpu().clone()
+                    for key, value
+                    in model.state_dict().items()
                 }
             else:
                 epochs_without_improvement += 1
 
-            if epochs_without_improvement >= patience:
+            if (
+                epochs_without_improvement
+                >= patience
+            ):
                 print(
-                    f"Early stopping tại epoch {epoch} "
-                    f"(val loss không cải thiện "
-                    f"{patience} epoch liên tiếp)."
+                    "Early stopping tai "
+                    f"epoch {epoch + 1}"
                 )
                 break
+
         else:
-            print(f"epoch {epoch:3d} | {log}")
+            print(
+                f"epoch {epoch + 1:03d} | {train_log}"
+            )
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -453,78 +616,108 @@ def run_training(
     return model
 
 
-@torch.no_grad()
-def extract_latents_for_engine(
-    model: SmartConv1DAutoencoder,
-    engine: EngineData,
-    batch_size: int = 200,
-    device: str = "cpu",
-) -> WindowBatch:
-    model.eval()
-
-    z_parts = []
-
-    for start in range(0, len(engine.X), batch_size):
-        end = min(start + batch_size, len(engine.X))
-
-        x = torch.from_numpy(
-            np.asarray(engine.X[start:end])
-        ).float().to(device)
-
-        x_model = _to_model_layout(x)
-        z = model.encode(x_model)
-
-        z_parts.append(z.cpu().numpy())
-
-    Z = np.concatenate(z_parts, axis=0)
-
-    return WindowBatch(
-        X=Z,
-        W=np.asarray(engine.W),
-        unit_number=np.full(
-            len(engine.X),
-            engine.unit_number,
-            dtype=object,
-        ),
-        cycle=np.asarray(engine.cycle),
-    )
-
+# ============================================================
+# MEASUREMENT-LEVEL LATENT EXTRACTION
+# ============================================================
 
 @torch.no_grad()
 def extract_measurement_latents_for_engine(
     model: SmartConv1DAutoencoder,
     engine: EngineData,
-    batch_size: int = 200,
+    batch_size: int = 256,
     device: str = "cpu",
 ) -> WindowBatch:
+    """
+    Encode tung measurement SPEV truc tiep thanh scalar Z.
+
+    Output X cua WindowBatch:
+        (N_measurements, 1)
+    """
+
     _validate_engine_structure(engine)
 
-    window_latents = extract_latents_for_engine(
+    if model.z_dim != Z_DIM:
+        raise ValueError(
+            f"Phase I yeu cau z_dim={Z_DIM}, model co {model.z_dim}."
+        )
+
+    if batch_size <= 0:
+        raise ValueError(
+            "batch_size phai > 0."
+        )
+
+    model.eval()
+    z_parts: list[np.ndarray] = []
+
+    for start in range(
+        0,
+        len(engine.X),
+        batch_size,
+    ):
+        end = min(
+            start + batch_size,
+            len(engine.X),
+        )
+
+        x = torch.from_numpy(
+            np.asarray(
+                engine.X[start:end],
+                dtype=np.float32,
+            )
+        ).to(
+            device=device,
+            dtype=torch.float32,
+        )
+
+        z = model.encode(x)
+        z_parts.append(
+            z.cpu().numpy()
+        )
+
+    Z = np.concatenate(
+        z_parts,
+        axis=0,
+    )
+
+    expected_shape = (
+        len(engine.X),
+        Z_DIM,
+    )
+
+    if Z.shape != expected_shape:
+        raise RuntimeError(
+            f"Unexpected latent shape {Z.shape}, expected {expected_shape}."
+        )
+
+    return WindowBatch(
+        X=Z,
+        W=np.asarray(
+            engine.W,
+            dtype=np.float32,
+        ),
+        unit_number=np.full(
+            len(engine.X),
+            engine.unit_number,
+            dtype=object,
+        ),
+        cycle=np.asarray(
+            engine.cycle
+        ),
+    )
+
+
+@torch.no_grad()
+def extract_latents_for_engine(
+    model: SmartConv1DAutoencoder,
+    engine: EngineData,
+    batch_size: int = 256,
+    device: str = "cpu",
+) -> WindowBatch:
+    """Backward-compatible alias; latent hien tai da la measurement-level."""
+
+    return extract_measurement_latents_for_engine(
         model=model,
         engine=engine,
         batch_size=batch_size,
         device=device,
-    )
-
-    z = torch.from_numpy(np.asarray(window_latents.X)).float().to(device)
-    z_mean, measurement_id = _mean_pool_z(
-        z=z,
-        cycle=window_latents.cycle,
-    )
-
-    W = np.asarray(engine.W).reshape(
-        -1,
-        SUBWINDOWS_PER_MEASUREMENT,
-        engine.W.shape[-1],
-    )[:, 0, :]
-
-    return WindowBatch(
-        X=z_mean.cpu().numpy(),
-        W=W,
-        unit_number=np.full(
-            len(measurement_id),
-            engine.unit_number,
-            dtype=object,
-        ),
-        cycle=measurement_id,
     )

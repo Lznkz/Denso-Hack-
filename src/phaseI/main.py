@@ -1,393 +1,516 @@
 from pathlib import Path
 
-import numpy as np
 import torch
 
-from src.phaseI.core.windowing import EngineData
+from src.phaseI.core.preprocess import (
+    PreprocessConfig,
+    preprocess_many,
+)
+from src.phaseI.core.windowing import (
+    fit_normalization,
+    load_engines,
+)
 from src.phaseI.core.train import (
-    SUBWINDOWS_PER_MEASUREMENT,
+    Z_DIM,
     run_training,
 )
 
 
+# ============================================================
+# DEVICE
+# ============================================================
+
 def _default_device() -> str:
     if torch.cuda.is_available():
         return "cuda"
-    if torch.backends.mps.is_available():
+
+    if (
+        hasattr(torch.backends, "mps")
+        and torch.backends.mps.is_available()
+    ):
         return "mps"
+
     return "cpu"
 
 
+# ============================================================
+# CONFIG
+# ============================================================
+
 CONFIG = {
-    "prepared_root": "processed",
-    "bearings": ["B01", "B05", "B12", "B17"],
-    "val_bearing": "B17",
+    # --------------------------------------------------------
+    # DATA
+    # --------------------------------------------------------
+    # Raw Paderborn root. Moi bearing duoc ky vong o:
+    #   data/Bxx/vibrationData/*.mat
+    #   data/Bxx/Bxx_operatingConditions.csv
+    "raw_data_dir": "data",
 
-    # FFT từ sub-window raw dài 4096 -> rfft có 2049 bins.
-    "window_len": 2049,
+    # Output root cua preprocess SPEV moi:
+    #   processed_dual/Bxx/X_hi_spev.npy
+    #   processed_dual/Bxx/W.npy
+    #   processed_dual/Bxx/measurement_id.npy
+    "preprocessed_dir": "processed_dual",
 
-    # Tính theo SUB-WINDOW.
-    # 200 = 8 measurement x 25 sub-window.
-    "batch_size": 200,
+    # Main tu dong preprocess nhung bearing chua co du output HI.
+    # Neu output da day du thi bearing do duoc bo qua.
+    "auto_preprocess": False,
+    "preprocess_overwrite": False,
+    "refit_normalization": True,
 
-    "z_dim": 16,
-    "hidden_channels": (16, 8),
+    # De test nhanh co the gioi han measurement cho tung bearing, vi du:
+    # {"B01": 20}. De {} de dung tat ca raw measurement dang co.
+    "preprocess_measurement_max": {},
 
-    "n_epochs": 100,
-    "lr": 1e-4,
-    "patience": 5,
-    "min_delta": 1e-5,
+    "preprocess_config": {
+        "target_fs": 64_000.0,
+        "n_order_bins": 2049,
+        "max_order": 600.0,
+        "hi_n_buckets": 32,
+    },
+
+    # Scaler duoc fit LAI chi tu train bearings moi lan train.
+    "normalization_path": "normalization_spev_except_17.npz",
+
+    "train_engines": [
+        "B10",
+        "B11",
+        "B12",
+        "B13",
+        "B14",
+    ],
+
+    # De trong neu chua chot validation split.
+    # Neu them bearing vao day, chung chi duoc transform bang scaler
+    # da fit tren train_engines; tuyet doi khong tham gia fit scaler.
+    "val_engines": ["B17"],
+
+    # --------------------------------------------------------
+    # MODEL
+    # --------------------------------------------------------
+    # Z co dinh = 1 trong train.py/model pipeline.
+    # Khong expose z_dim nhu hyperparameter o main.
+    "hidden_channels": (
+        32,
+        16,
+        8,
+    ),
+
+    # --------------------------------------------------------
+    # TRAINING
+    # --------------------------------------------------------
+    "batch_size": 128,
+    "n_epochs": 20,
+    "lr": 1e-3,
     "seed": 0,
     "device": _default_device(),
 
-    # Baseline = mean latent của N measurement đầu của từng bearing.
-    "n_baseline_bins": 5,
+    # L = MAE + lambda_ng * L_NG
+    "lambda_ng": 1,
 
-    # Temporal losses chạy trên z_mean measurement-level.
-    "lambda_mono": 0.1,
-    "lambda_anticollapse": 0.0,
-    "lambda_smooth": 0.02,
-    "min_std": 0.1,
+    "grad_clip": 5.0,
+    "patience": 5,
+    "min_delta": 1e-4,
 
-    # Dùng W thật đầy đủ.
-    "w_dropout_start": 0.0,
-    "w_dropout_end": 0.0,
-    "w_dropout_epochs": 0,
+    # --------------------------------------------------------
+    # OUTPUT
+    # --------------------------------------------------------
+    "checkpoint_path": "thien_gay_cut.pt",
 
-    "checkpoint_path": "smart_ae_paderborn.pt",
+    # True -> 1 epoch de kiem tra pipeline.
+    "smoke_test": False,
 }
 
 
-def _validate_measurement_layout(
-    code: str,
-    X: np.ndarray,
-    W: np.ndarray,
-    measurement_id: np.ndarray,
+# ============================================================
+# HELPERS
+# ============================================================
+
+def _validate_split(
+    train_engines: list[str],
+    val_engines: list[str],
 ) -> None:
-    if len(X) != len(W) or len(X) != len(measurement_id):
-        raise ValueError(
-            f"{code}: số dòng không khớp: "
-            f"X={len(X)}, W={len(W)}, measurement_id={len(measurement_id)}"
-        )
-
-    if X.ndim != 3:
-        raise ValueError(
-            f"{code}: X phải có shape (N, channels, n_freqs), got {X.shape}"
-        )
-
-    if W.ndim != 2:
-        raise ValueError(
-            f"{code}: W phải có shape (N, w_dim), got {W.shape}"
-        )
-
-    if X.shape[2] != CONFIG["window_len"]:
-        raise ValueError(
-            f"{code}: expected n_freqs={CONFIG['window_len']}, "
-            f"got {X.shape[2]}"
-        )
-
-    if len(X) % SUBWINDOWS_PER_MEASUREMENT != 0:
-        raise ValueError(
-            f"{code}: N={len(X)} không chia hết cho "
-            f"{SUBWINDOWS_PER_MEASUREMENT} sub-window/measurement."
-        )
-
-    cycle_grouped = np.asarray(measurement_id).reshape(
-        -1,
-        SUBWINDOWS_PER_MEASUREMENT,
-    )
-
-    if not np.all(cycle_grouped == cycle_grouped[:, :1]):
-        raise ValueError(
-            f"{code}: measurement_id không được nhóm thành block "
-            f"{SUBWINDOWS_PER_MEASUREMENT} sub-window liên tiếp."
-        )
-
-    W_grouped = np.asarray(W).reshape(
-        -1,
-        SUBWINDOWS_PER_MEASUREMENT,
-        W.shape[1],
-    )
-
-    if not np.allclose(
-        W_grouped,
-        W_grouped[:, :1, :],
-        rtol=1e-5,
-        atol=1e-6,
-        equal_nan=True,
-    ):
-        raise ValueError(
-            f"{code}: W không giống nhau giữa các sub-window "
-            f"của cùng measurement."
-        )
-
-
-def load_engines(
-    prepared_root: str,
-    bearings: list[str],
-) -> list[EngineData]:
-    """
-    Mỗi bearing cần có:
-        X_fft.npy           -> (N_subwindows, 2, 2049)
-        W.npy               -> (N_subwindows, w_dim)
-        measurement_id.npy  -> (N_subwindows,)
-    """
-    root = Path(prepared_root)
-    engines = []
-
-    for code in bearings:
-        bearing_dir = root / code
-
-        x_path = bearing_dir / "X_fft.npy"
-        w_path = bearing_dir / "W.npy"
-        id_path = bearing_dir / "measurement_id.npy"
-
-        for path in (x_path, w_path, id_path):
-            if not path.exists():
-                raise FileNotFoundError(f"Không tìm thấy: {path}")
-
-        X = np.load(x_path, mmap_mode="r")
-        W = np.load(w_path, mmap_mode="r")
-        measurement_id = np.load(id_path, mmap_mode="r")
-
-        _validate_measurement_layout(
-            code=code,
-            X=X,
-            W=W,
-            measurement_id=measurement_id,
-        )
-
-        engine = EngineData(
-            unit_number=code,
-            X=X,
-            W=W,
-            cycle=measurement_id,
-        )
-        engines.append(engine)
-
-        n_measurements = len(X) // SUBWINDOWS_PER_MEASUREMENT
-
-        print(
-            f"{code}: X={X.shape}, W={W.shape}, "
-            f"measurements={n_measurements}, "
-            f"subwindows/measurement={SUBWINDOWS_PER_MEASUREMENT}"
-        )
-
-    return engines
-
-
-def split_train_val(
-    engines: list[EngineData],
-    val_bearing: str,
-) -> tuple[list[EngineData], list[EngineData]]:
-    train_engines = [
-        engine for engine in engines
-        if engine.unit_number != val_bearing
-    ]
-
-    val_engines = [
-        engine for engine in engines
-        if engine.unit_number == val_bearing
-    ]
-
     if not train_engines:
-        raise ValueError("Không có bearing train.")
+        raise ValueError("train_engines khong duoc rong.")
 
-    if not val_engines:
-        raise ValueError(
-            f"Không tìm thấy validation bearing: {val_bearing}"
-        )
+    if len(set(train_engines)) != len(train_engines):
+        raise ValueError("train_engines co bearing bi lap.")
 
-    return train_engines, val_engines
+    if len(set(val_engines)) != len(val_engines):
+        raise ValueError("val_engines co bearing bi lap.")
 
-
-def normalize_engines(
-    train_engines: list[EngineData],
-    val_engines: list[EngineData],
-) -> dict[str, np.ndarray]:
-    """
-    X:
-        z-score theo từng channel, fit trên TRAIN.
-        Statistics được tính qua toàn bộ sub-window và toàn bộ frequency bin.
-
-    W:
-        min-max theo TRAIN.
-
-    Validation chỉ dùng statistics đã fit từ TRAIN.
-    """
-    channel_sum = None
-    channel_sq_sum = None
-    total_count = 0
-
-    for engine in train_engines:
-        X = np.asarray(engine.X)
-
-        s = X.sum(axis=(0, 2), dtype=np.float64)
-        ss = np.square(
-            X,
-            dtype=np.float64,
-        ).sum(axis=(0, 2))
-        count = X.shape[0] * X.shape[2]
-
-        if channel_sum is None:
-            channel_sum = s
-            channel_sq_sum = ss
-        else:
-            channel_sum += s
-            channel_sq_sum += ss
-
-        total_count += count
-
-    x_mean = channel_sum / total_count
-    x_var = channel_sq_sum / total_count - x_mean ** 2
-    x_std = np.sqrt(np.maximum(x_var, 1e-12))
-
-    x_mean = x_mean[None, :, None]
-    x_std = x_std[None, :, None]
-
-    for engine in train_engines + val_engines:
-        engine.X = (
-            (np.asarray(engine.X) - x_mean) / x_std
-        ).astype(np.float32)
-
-    W_train = np.concatenate(
-        [np.asarray(engine.W) for engine in train_engines],
-        axis=0,
+    overlap = sorted(
+        set(train_engines)
+        & set(val_engines)
     )
 
-    if not np.isfinite(W_train).all():
+    if overlap:
         raise ValueError(
-            "W_train chứa NaN/Inf. Kiểm tra operatingConditions trước khi train."
+            "Train/validation bearing bi overlap: "
+            + ", ".join(overlap)
         )
 
-    w_min = W_train.min(axis=0)
-    w_range = np.ptp(W_train, axis=0)
-    w_range[w_range < 1e-8] = 1.0
 
-    for engine in train_engines + val_engines:
-        W = np.asarray(engine.W)
-
-        if not np.isfinite(W).all():
+def _check_loaded_contract(
+    engines,
+    label: str,
+    n_sensors: int,
+    n_buckets: int,
+    w_dim: int,
+) -> None:
+    for engine in engines:
+        if engine.X.shape[1:] != (
+            n_sensors,
+            n_buckets,
+        ):
             raise ValueError(
-                f"{engine.unit_number}: W chứa NaN/Inf."
+                f"{label} {engine.unit_number}: "
+                f"X shape={engine.X.shape[1:]}, "
+                f"expected={(n_sensors, n_buckets)}"
             )
 
-        engine.W = np.clip(
-            (W - w_min) / w_range,
-            0.0,
-            1.0,
-        ).astype(np.float32)
-
-    return {
-        "x_mean": x_mean.astype(np.float32),
-        "x_std": x_std.astype(np.float32),
-        "w_min": w_min.astype(np.float32),
-        "w_range": w_range.astype(np.float32),
-    }
+        if engine.W.shape[1] != w_dim:
+            raise ValueError(
+                f"{label} {engine.unit_number}: "
+                f"W dim={engine.W.shape[1]}, "
+                f"expected={w_dim}"
+            )
 
 
-def main():
-    cfg = CONFIG
+_REQUIRED_HI_OUTPUTS = (
+    "X_hi_spev.npy",
+    "W.npy",
+    "measurement_id.npy",
+)
 
-    if cfg["batch_size"] % SUBWINDOWS_PER_MEASUREMENT != 0:
-        raise ValueError(
-            f"batch_size={cfg['batch_size']} phải là bội số của "
-            f"{SUBWINDOWS_PER_MEASUREMENT}."
+
+def _bearing_is_preprocessed(
+    bearing_id: str,
+    output_root: str | Path,
+) -> bool:
+    bearing_dir = Path(output_root) / bearing_id
+    return all(
+        (bearing_dir / name).is_file()
+        for name in _REQUIRED_HI_OUTPUTS
+    )
+
+
+def _ensure_preprocessed(
+    bearing_ids: list[str],
+    cfg: dict,
+) -> None:
+    if not bearing_ids:
+        return
+
+    overwrite = bool(cfg["preprocess_overwrite"])
+
+    missing = [
+        bearing_id
+        for bearing_id in bearing_ids
+        if not _bearing_is_preprocessed(
+            bearing_id=bearing_id,
+            output_root=cfg["preprocessed_dir"],
+        )
+    ]
+
+    # overwrite=True means explicitly rebuild every requested bearing.
+    # This is useful after a smoke/partial preprocessing run.
+    targets = list(bearing_ids) if overwrite else missing
+
+    if not targets:
+        print("Preprocess: all requested bearings already exist; skip.")
+        return
+
+    if not cfg["auto_preprocess"]:
+        raise FileNotFoundError(
+            "Missing preprocessed bearings: "
+            + ", ".join(missing)
+            + ". Set auto_preprocess=True or run preprocess.py first."
         )
 
+    # HI preprocessing intentionally does NOT depend on localization
+    # window_len / expected_windows_per_measurement. Those remain
+    # internal defaults of preprocess.py for branch='localize' only.
+    prep_args = cfg["preprocess_config"]
+    prep_cfg = PreprocessConfig(
+        target_fs=float(prep_args["target_fs"]),
+        n_order_bins=int(prep_args["n_order_bins"]),
+        max_order=float(prep_args["max_order"]),
+        hi_n_buckets=int(prep_args["hi_n_buckets"]),
+    )
+
+    print("\nPreprocessing bearings from RAW data...")
+    print("Raw root:", cfg["raw_data_dir"])
+    print("Output root:", cfg["preprocessed_dir"])
+    print("Bearings:", targets)
+    if overwrite:
+        print("Overwrite: True (rebuild requested bearings)")
+
+    preprocess_many(
+        bearings=targets,
+        base_dir=cfg["raw_data_dir"],
+        output_root=cfg["preprocessed_dir"],
+        cfg=prep_cfg,
+        branch="hi",
+        measurement_max_by_bearing=dict(
+            cfg["preprocess_measurement_max"]
+        ),
+        overwrite=overwrite,
+    )
+
+    # Fail early if preprocessing did not create the downstream contract.
+    still_missing = [
+        bearing_id
+        for bearing_id in bearing_ids
+        if not _bearing_is_preprocessed(
+            bearing_id=bearing_id,
+            output_root=cfg["preprocessed_dir"],
+        )
+    ]
+    if still_missing:
+        raise RuntimeError(
+            "Preprocessing finished but required HI outputs are still missing for: "
+            + ", ".join(still_missing)
+        )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main() -> None:
+    cfg = CONFIG
+
+    train_ids = list(cfg["train_engines"])
+    val_ids = list(cfg["val_engines"])
+
+    _validate_split(
+        train_engines=train_ids,
+        val_engines=val_ids,
+    )
+
+    print("=" * 70)
+    print("SMART AE - PHASE I / SPEV")
+    print("=" * 70)
     print("Device:", cfg["device"])
+    print("Z dim:", Z_DIM)
+
+    # ========================================================
+    # 0. RAW -> SPEV PREPROCESS (ONLY IF OUTPUT IS MISSING)
+    # ========================================================
+
+    requested_ids = list(dict.fromkeys(train_ids + val_ids))
+    _ensure_preprocessed(
+        bearing_ids=requested_ids,
+        cfg=cfg,
+    )
+
+    # ========================================================
+    # 1. FIT NORMALIZATION ON TRAIN BEARINGS ONLY
+    # ========================================================
+
+    print("\nFitting normalization on TRAIN bearings only...")
+
+    norm = fit_normalization(
+        train_engine_ids=train_ids,
+        data_dir=cfg["preprocessed_dir"],
+        output_path=cfg["normalization_path"],
+    )
+
+    # ========================================================
+    # 2. LOAD TRAIN / VALIDATION WITH FROZEN SCALER
+    # ========================================================
+
+    print("\nLoading training bearings...")
+
+    train_engines = load_engines(
+        engine_ids=train_ids,
+        data_dir=cfg["preprocessed_dir"],
+        normalization_path=cfg["normalization_path"],
+    )
+
+    if val_ids:
+        print("\nLoading validation bearings...")
+
+        val_engines = load_engines(
+            engine_ids=val_ids,
+            data_dir=cfg["preprocessed_dir"],
+            normalization_path=cfg["normalization_path"],
+        )
+    else:
+        val_engines = None
+
+    # ========================================================
+    # 3. INPUT CONTRACT
+    # ========================================================
+
+    first = train_engines[0]
+
+    n_sensors = int(first.X.shape[1])
+    n_buckets = int(first.X.shape[2])
+    w_dim = int(first.W.shape[1])
+
+    _check_loaded_contract(
+        engines=train_engines,
+        label="train",
+        n_sensors=n_sensors,
+        n_buckets=n_buckets,
+        w_dim=w_dim,
+    )
+
+    if val_engines:
+        _check_loaded_contract(
+            engines=val_engines,
+            label="val",
+            n_sensors=n_sensors,
+            n_buckets=n_buckets,
+            w_dim=w_dim,
+        )
+
+    print("\nInput contract:")
     print(
-        "Measurements/batch:",
-        cfg["batch_size"] // SUBWINDOWS_PER_MEASUREMENT,
+        "  X_tilde = "
+        f"(N_measurements, {n_sensors}, {n_buckets})"
     )
-
-    # 1. Load
-    all_engines = load_engines(
-        prepared_root=cfg["prepared_root"],
-        bearings=cfg["bearings"],
-    )
-
-    # 2. Split theo bearing
-    train_engines, val_engines = split_train_val(
-        all_engines,
-        val_bearing=cfg["val_bearing"],
-    )
-
-    print("Train:", [e.unit_number for e in train_engines])
-    print("Validation:", [e.unit_number for e in val_engines])
-
-    # 3. Normalize bằng TRAIN statistics
-    norm_stats = normalize_engines(
-        train_engines=train_engines,
-        val_engines=val_engines,
-    )
-
-    # 4. Model dimensions
-    n_sensors = train_engines[0].X.shape[1]
-    window_len = train_engines[0].X.shape[2]
-    w_dim = train_engines[0].W.shape[1]
-
     print(
-        f"n_sensors={n_sensors}, "
-        f"window_len={window_len}, "
-        f"w_dim={w_dim}, "
-        f"z_dim={cfg['z_dim']}"
+        "  W_tilde = "
+        f"(N_measurements, {w_dim})"
+    )
+    print("  Z = (N_measurements, 1)")
+    print(
+        "  X normalization: log1p -> StandardScaler(train only)"
+    )
+    print(
+        "  W normalization: StandardScaler(train only)"
     )
 
-    # 5. Train
+    # ========================================================
+    # 4. SMOKE / FULL TRAINING
+    # ========================================================
+
+    if cfg["smoke_test"]:
+        n_epochs = 1
+        print("\n*** SMOKE TEST: 1 epoch ***")
+    else:
+        n_epochs = int(cfg["n_epochs"])
+
     model = run_training(
         engines=train_engines,
         val_engines=val_engines,
-        n_sensors=n_sensors,
-        w_dim=w_dim,
-        window_len=window_len,
         batch_size=cfg["batch_size"],
-        z_dim=cfg["z_dim"],
         hidden_channels=cfg["hidden_channels"],
-        n_epochs=cfg["n_epochs"],
+        n_epochs=n_epochs,
         lr=cfg["lr"],
         seed=cfg["seed"],
         device=cfg["device"],
-        lambda_mono=cfg["lambda_mono"],
-        lambda_anticollapse=cfg["lambda_anticollapse"],
-        lambda_smooth=cfg["lambda_smooth"],
-        n_baseline_bins=cfg["n_baseline_bins"],
-        min_std=cfg["min_std"],
-        w_dropout_start=cfg["w_dropout_start"],
-        w_dropout_end=cfg["w_dropout_end"],
-        w_dropout_epochs=cfg["w_dropout_epochs"],
+        lambda_ng=cfg["lambda_ng"],
         patience=cfg["patience"],
         min_delta=cfg["min_delta"],
+        grad_clip=cfg["grad_clip"],
     )
 
-    # 6. Save checkpoint
+    if model.z_dim != Z_DIM:
+        raise RuntimeError(
+            f"Expected model.z_dim={Z_DIM}, got {model.z_dim}."
+        )
+
+    # ========================================================
+    # 5. CHECKPOINT
+    # ========================================================
+
     checkpoint = {
+        "version": "smart_ae_spev_ng_v1",
+
         "model_state_dict": model.state_dict(),
-        "config": cfg,
-        "normalization": {
-            "x_mean": norm_stats["x_mean"],
-            "x_std": norm_stats["x_std"],
-            "w_min": norm_stats["w_min"],
-            "w_range": norm_stats["w_range"],
-        },
-        "data_layout": {
-            "x_file": "X_fft.npy",
-            "subwindows_per_measurement": SUBWINDOWS_PER_MEASUREMENT,
+
+        "model_config": {
             "n_sensors": n_sensors,
-            "window_len": window_len,
+            "n_buckets": n_buckets,
             "w_dim": w_dim,
+            "z_dim": Z_DIM,
+            "hidden_channels": tuple(
+                cfg["hidden_channels"]
+            ),
+            "kernel_size": int(model.kernel_size),
+        },
+
+        "training_config": {
+            "train_engines": train_ids,
+            "val_engines": val_ids,
+            "batch_size": int(cfg["batch_size"]),
+            "n_epochs": n_epochs,
+            "lr": float(cfg["lr"]),
+            "lambda_ng": float(cfg["lambda_ng"]),
+            "seed": int(cfg["seed"]),
+            "grad_clip": cfg["grad_clip"],
+        },
+
+        # Luu kem train-fitted scaler de inference co the dung dung
+        # transform cua training, khong can fit lai tren test bearing.
+        "normalization": {
+            "x_mean": norm["x_mean"],
+            "x_std": norm["x_std"],
+            "w_mean": norm["w_mean"],
+            "w_std": norm["w_std"],
+            "x_transform": "log1p_then_standard_scaler",
+            "w_transform": "standard_scaler",
+            "fit_scope": "train_bearings_only",
+        },
+
+        "data_layout": {
+            "layout": "channel_first",
+            "sample_level": "measurement",
+            "n_sensors": n_sensors,
+            "n_buckets": n_buckets,
+            "w_dim": w_dim,
+            "x_shape": [
+                n_sensors,
+                n_buckets,
+            ],
+            "representation": "order_spev",
+        },
+
+        "latent_semantics": {
+            "z_dim": Z_DIM,
+            "temporal_constraint": "negative_gradient",
+            "direction": "non_increasing_with_measurement_id",
+            "plateau_penalty": False,
         },
     }
 
-    torch.save(
-        checkpoint,
-        cfg["checkpoint_path"],
+    path = Path(cfg["checkpoint_path"])
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
     )
 
-    print(f"Đã lưu: {cfg['checkpoint_path']}")
+    if cfg["smoke_test"]:
+        path = path.with_name(
+            path.stem
+            + "_smoke"
+            + path.suffix
+        )
+
+    torch.save(
+        checkpoint,
+        path,
+    )
+
+    print("\n" + "=" * 70)
+    print("DONE")
+    print("=" * 70)
+    print("Saved:", path)
     print(
-        "Temporal loss đã được tính trên z_mean measurement-level; "
-        "không cần group/broadcast Z trong main.py."
+        "X_tilde: "
+        f"(batch, {n_sensors}, {n_buckets})"
+    )
+    print(
+        "W_tilde: "
+        f"(batch, {w_dim})"
+    )
+    print(
+        "Z: "
+        f"(batch, {Z_DIM})"
     )
 
 

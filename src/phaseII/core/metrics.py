@@ -1,86 +1,114 @@
 """
-metrics.py -- C-index, IBS, calibration, và điểm RUL suy ra để so RMSE cũ.
+metrics.py -- ĐO LƯỜNG VÀ ĐÁNH GIÁ CHẤT LƯỢNG DỰ BÁO RUL CHO PHASE II
 
-Dùng lifelines cho C-index (concordance_index_censored có sẵn, không tự
-viết lại công thức cặp đôi), scikit-survival cho IBS. Cài đặt:
-    pip install lifelines scikit-survival --break-system-packages
-
-KHÔNG import các thư viện này ở đầu module để tránh việc chỉ cần build
-model/loss cũng phải cài scikit-survival -- import cục bộ trong hàm.
+Hỗ trợ các chỉ số chuẩn PHM (Prognostics and Health Management):
+  1. RMSE & MAE trên các chu kỳ đã suy thoái (tau >= 1).
+  2. Coverage Probability: Tỷ lệ chu kỳ RUL thật nằm trong dải [RUL_0.05, RUL_0.95] (kỳ vọng >= 90%).
+  3. Asymmetric PHM Penalty: Phạt nặng dự đoán trễ (overestimation) hơn dự đoán sớm.
+  4. C-index: Đo mức độ xếp hạng rủi ro tương đối giữa các vòng bi.
 """
 
+from __future__ import annotations
 import numpy as np
 
 
-def hazard_to_survival(h: np.ndarray) -> np.ndarray:
+def compute_rul_errors(
+    predicted_ruls: list[float],
+    true_ruls: list[float],
+) -> dict[str, float]:
     """
-    h: (T,) chuỗi hazard của MỘT engine (đã cắt đúng phần thật, không
-    padding). Trả về S(t) = prod_{s<=t} (1 - h(s)).
+    Tính RMSE, MAE và sai số trung bình giữa RUL dự báo và RUL thực tế.
     """
-    return np.cumprod(1.0 - h)
+    preds = np.asarray(predicted_ruls, dtype=np.float64)
+    trues = np.asarray(true_ruls, dtype=np.float64)
+
+    if len(preds) == 0:
+        return {"rmse": float("nan"), "mae": float("nan"), "bias": float("nan")}
+
+    diff = preds - trues
+    rmse = float(np.sqrt(np.mean(diff ** 2)))
+    mae = float(np.mean(np.abs(diff)))
+    bias = float(np.mean(diff))
+
+    return {"rmse": rmse, "mae": mae, "bias": bias}
 
 
-def median_survival_time(h: np.ndarray) -> float:
+def compute_interval_coverage(
+    lower_ruls: list[float],
+    upper_ruls: list[float],
+    true_ruls: list[float],
+) -> float:
     """
-    Điểm S(t) cắt qua 0.5 -- dùng để suy ra một con số "RUL" có thể so
-    sánh (không phải tối ưu trực tiếp) với RMSE 15.7 của pipeline cũ.
-    Nếu S(t) không bao giờ xuống dưới 0.5 trong toàn bộ sequence quan sát
-    được, trả về len(h) như một giá trị "ít nhất còn sống đến đây"
-    (right-censored ước lượng, không phải giá trị chính xác).
+    Tính tỷ lệ phần trăm (0 - 100%) mà RUL thực tế rơi vào khoảng tin cậy [RUL_lower, RUL_upper].
     """
-    s = hazard_to_survival(h)
-    below = np.where(s <= 0.5)[0]
-    if len(below) == 0:
-        return float(len(h))
-    return float(below[0])
+    lows = np.asarray(lower_ruls, dtype=np.float64)
+    highs = np.asarray(upper_ruls, dtype=np.float64)
+    trues = np.asarray(true_ruls, dtype=np.float64)
+
+    if len(trues) == 0:
+        return float("nan")
+
+    covered = (trues >= lows) & (trues <= highs)
+    return float(np.mean(covered) * 100.0)
 
 
-def concordance_index(event_times: np.ndarray, predicted_risk: np.ndarray,
-                       event_observed: np.ndarray) -> float:
+def asymmetric_phm_score(
+    predicted_ruls: list[float],
+    true_ruls: list[float],
+    a1: float = 13.0,
+    a2: float = 10.0,
+) -> float:
     """
-    event_times: thời điểm cuối cùng quan sát được của mỗi engine (bin xảy
-                 ra sự kiện, hoặc bin cuối nếu censored)
-    predicted_risk: điểm rủi ro mô hình cho ra -- dùng NEGATIVE của median
-                 survival time (thời gian sống dự đoán càng ngắn thì rủi ro
-                 càng cao), hoặc trực tiếp dùng h(T) tại bin cuối quan sát.
-    event_observed: 1 nếu có sự kiện thật, 0 nếu censored
+    Ham cham diem phi doi xung chuan PHM Data Challenge.
 
-    lifelines quy ước: risk càng cao => event xảy ra càng sớm. Nếu bạn
-    truyền predicted_risk = median_survival_time (số càng lớn = càng an
-    toàn), cần đảo dấu trước khi gọi hàm này.
+    d = pred - true
+      d < 0: underestimation / early prediction (du doan som, conservative):
+             penalty = exp(-d / a1) - 1   (a1 lon hon -> exponential doc nhe hon)
+      d > 0: overestimation / late prediction (du doan tre - nguy hiem trong san xuat):
+             penalty = exp(d / a2) - 1    (a2 nho hon -> exponential doc doc hon -> phat manh hon)
+
+    Mac dinh a1=13, a2=10: voi cung |d|, overestimation bi phat nang hon underestimation.
+    Luu y: a1 > a2, nguoc lai voi cach ki hieu trong mot so tai lieu dung convention nguoc.
+    """
+    preds = np.asarray(predicted_ruls, dtype=np.float64)
+    trues = np.asarray(true_ruls, dtype=np.float64)
+
+    if len(preds) == 0:
+        return float("nan")
+
+    diff = preds - trues
+    scores = np.where(diff < 0, np.exp(-diff / a1) - 1.0, np.exp(diff / a2) - 1.0)
+    return float(np.sum(scores))
+
+
+def concordance_index(
+    event_times: np.ndarray,
+    predicted_risk: np.ndarray,
+    event_observed: np.ndarray,
+    higher_is_risk: bool = True,
+) -> float:
+    """
+    Concordance Index (C-index) danh gia xep hang rui ro tuong doi giua cac vong bi.
+
+    Parameters
+    ----------
+    event_times : np.ndarray
+        Thoi diem hong thuc te (survival time).
+    predicted_risk : np.ndarray
+        Score du bao. Neu higher_is_risk=True (mac dinh), score cao = rui ro cao =
+        survival time ngan hon. Ham tu dao dau truoc khi truyen cho lifelines.
+    event_observed : np.ndarray
+        1 neu su kien duoc quan sat.
+    higher_is_risk : bool
+        True (mac dinh): predicted_risk cao = rui ro cao -> can dao dau.
+        False: predicted_risk cao = survival dai hon -> dung truc tiep.
+
+    Notes
+    -----
+    lifelines.concordance_index(event_times, predicted_scores) ky vong predicted_scores
+    cao tuong ung survival time dai. Neu truyen thang predicted_risk (cao = rui ro cao)
+    ma khong dao dau, C-index se cho ket qua nguoc (duoi 0.5 thuc ra la model tot).
     """
     from lifelines.utils import concordance_index as _ci
-    return _ci(event_times, predicted_risk, event_observed)
-
-
-def integrated_brier_score(train_event_times, train_event_observed,
-                            test_event_times, test_event_observed,
-                            survival_curves: np.ndarray, time_grid: np.ndarray) -> float:
-    """
-    survival_curves: (n_test, n_time_grid) -- S(t) dự đoán cho từng engine
-                      tại các mốc thời gian trong time_grid.
-
-    scikit-survival cần structured array cho event/time -- xem ví dụ dùng
-    trong train.py. Đây là hàm mỏng bọc lại, không tự implement Brier
-    score, tránh sai công thức IPCW.
-    """
-    from sksurv.metrics import integrated_brier_score as _ibs
-    from sksurv.util import Surv
-
-    y_train = Surv.from_arrays(train_event_observed.astype(bool), train_event_times)
-    y_test = Surv.from_arrays(test_event_observed.astype(bool), test_event_times)
-    return _ibs(y_train, y_test, survival_curves, time_grid)
-
-def cumulative_hazard(h: np.ndarray) -> float:
-    """
-    -log(S(T)) = tổng -log(1-h(t)) qua toàn bộ chuỗi quan sát được.
-    Không bao giờ bão hòa như median_survival_time -- càng nhiều bin có
-    h cao (dù chưa vượt 0.5), giá trị này càng tăng, phản ánh đúng "tổng
-    lượng rủi ro tích lũy" thay vì chỉ hỏi "đã vượt ngưỡng 0.5 chưa".
-    Đây là thước đo rủi ro chuẩn trong survival analysis (tương đương
-    linear predictor trong Cox model), phù hợp làm predicted_risk cho
-    C-index hơn hẳn median survival time.
-    """
-    eps = 1e-7
-    h = np.clip(h, eps, 1 - eps)
-    return float(-np.sum(np.log(1 - h)))
+    scores = -np.asarray(predicted_risk, dtype=np.float64) if higher_is_risk else np.asarray(predicted_risk, dtype=np.float64)
+    return float(_ci(event_times, scores, event_observed))
