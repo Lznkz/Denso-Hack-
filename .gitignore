@@ -76,6 +76,9 @@ test_Weiner/
 *.bin
 *.onnx
 *.safetensors
+*.csv
+*.png
+*.ipynb
 
 # Compressed archives
 *.zip
